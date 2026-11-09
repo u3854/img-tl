@@ -17,6 +17,7 @@ from common import (
     resolve_language,
     format_duration,
     SessionTracker,
+    RichArgumentParser,
     print_banner,
     print_step_header,
     preview_replacements,
@@ -135,7 +136,13 @@ def edit_image_via_sd_server(
     return out_img
 
 def main():
-    parser = argparse.ArgumentParser(description="Batch edit comic pages driven strictly by a translations JSON file.")
+    parser = RichArgumentParser(
+        prog="edit_comics.py",
+        description="Surgically inpaint translated English text onto comic pages using an SD server.",
+        epilog="""[bold cyan]uv run python edit_comics.py "comics/ch01/translations.json" --lang japanese[/bold cyan]
+[bold cyan]uv run python edit_comics.py "comics/ch01" --steps 6 --delay 30[/bold cyan]
+[bold cyan]uv run python edit_comics.py "comics/ch01" --export-prompts prompts.txt --export-only[/bold cyan]"""
+    )
     parser.add_argument(
         "translations_file",
         help="Path to the translations JSON file (images are loaded from the same folder)"
@@ -308,8 +315,11 @@ def main():
         api_start = time.perf_counter()
         edited_successfully = False
 
-        status_msg = f"Editing [bold magenta]{filename}[/bold magenta] via SD Server ({args.max_side}px)..."
-        with console.status(f"[bold magenta]{status_msg}[/bold magenta]", spinner="dots"):
+        with console.status(
+            f"  [bold bright_magenta]Inpainting comic page[/bold bright_magenta] [bold bright_yellow]{filename}[/bold bright_yellow] [dim]({args.max_side}px via SD)...[/dim]",
+            spinner="dots",
+            spinner_style="bold bright_magenta"
+        ):
             for attempt in range(1, args.retries + 2):
                 try:
                     edited_img = edit_image_via_sd_server(
@@ -332,10 +342,10 @@ def main():
                     break
                 except requests.exceptions.RequestException as e:
                     if attempt <= args.retries:
-                        print_warning(f"Request failed (Attempt {attempt}/{args.retries + 1}): {e}. Retrying in {int(RETRY_DELAY)}s...")
+                        print_warning(f"Request failed (Attempt [bold]{attempt}/{args.retries + 1}[/bold]): {e}. Retrying in {int(RETRY_DELAY)}s...")
                         time.sleep(RETRY_DELAY)
                     else:
-                        print_error(f"Failed after {args.retries + 1} attempts: {e}")
+                        print_error(f"Failed after [bold]{args.retries + 1}[/bold] attempts: {e}")
                 except Exception as e:
                     print_error(f"Unexpected error on {filename}: {e}")
                     break
@@ -345,7 +355,7 @@ def main():
 
         if edited_successfully:
             remaining_edits -= 1
-            print_success(f"Image edited and saved in {format_duration(api_elapsed)} ({len(dialogues)} text replacements)")
+            print_success(f"Image edited and saved in [bold white]{format_duration(api_elapsed)}[/bold white] ([bold cyan]{len(dialogues)}[/bold cyan] text replacements)")
             tracker.record_step(api_time=api_elapsed, cycle_time=cycle_elapsed, success=True)
 
             projected_sec, finish_clock = tracker.estimate_remaining(inter_item_delay=args.delay)

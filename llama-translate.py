@@ -5,7 +5,6 @@ import json
 import time
 import base64
 import mimetypes
-import argparse
 import requests
 from pathlib import Path
 
@@ -16,6 +15,7 @@ from common import (
     resolve_language,
     format_duration,
     SessionTracker,
+    RichArgumentParser,
     print_banner,
     print_step_header,
     preview_dialogues,
@@ -216,7 +216,13 @@ def save_results(output_file: Path, data: dict):
     os.replace(temp_file, output_file)
 
 def main():
-    parser = argparse.ArgumentParser(description="Translate comic pages using llama-server Vision API.")
+    parser = RichArgumentParser(
+        prog="llama-translate.py",
+        description="Translate comic pages using llama-server Vision API.",
+        epilog="""[bold cyan]uv run python llama-translate.py "comics/ch01" --lang japanese[/bold cyan]
+[bold cyan]uv run python llama-translate.py "comics/ch01" --lang korean --delay 30[/bold cyan]
+[bold cyan]uv run python llama-translate.py "comics/ch01" --thinking-effort medium --thinking-budget 2048[/bold cyan]"""
+    )
     parser.add_argument("folder", help="Path to the folder containing comic images")
     parser.add_argument(
         "--lang", "-l", 
@@ -331,8 +337,11 @@ def main():
         translation_data = None
         is_success = False
 
-        status_msg = f"Calling Vision API for [bold cyan]{filename}[/bold cyan]..."
-        with console.status(f"[bold cyan]{status_msg}[/bold cyan]", spinner="dots"):
+        with console.status(
+            f"  [bold bright_cyan]Calling Vision API for[/bold bright_cyan] [bold bright_yellow]{filename}[/bold bright_yellow] [dim]({language_name})...[/dim]",
+            spinner="dots",
+            spinner_style="bold bright_cyan"
+        ):
             for attempt in range(1, args.retries + 2):
                 try:
                     translation_data = translate_image(
@@ -349,10 +358,10 @@ def main():
                     break
                 except (requests.exceptions.RequestException, json.JSONDecodeError, ValueError) as e:
                     if attempt <= args.retries:
-                        print_warning(f"Attempt {attempt}/{args.retries + 1} failed ({e}). Retrying in {int(RETRY_DELAY)}s...")
+                        print_warning(f"Attempt [bold]{attempt}/{args.retries + 1}[/bold] failed ({e}). Retrying in {int(RETRY_DELAY)}s...")
                         time.sleep(RETRY_DELAY)
                     else:
-                        print_error(f"Failed after {args.retries + 1} attempts: {e}")
+                        print_error(f"Failed after [bold]{args.retries + 1}[/bold] attempts: {e}")
                         results[filename] = {"error": f"Failed: {str(e)}"}
                 except Exception as e:
                     print_error(f"Unexpected error: {e}")
@@ -363,10 +372,10 @@ def main():
 
         if is_success and translation_data:
             dialogues = translation_data.get("dialogues", [])
-            print_success(f"Translation completed in {format_duration(api_elapsed)} ({len(dialogues)} dialogues found)")
+            print_success(f"Translation completed in [bold white]{format_duration(api_elapsed)}[/bold white] ([bold cyan]{len(dialogues)}[/bold cyan] dialogues found)")
             preview_dialogues(dialogues)
         else:
-            print_error(f"Translation failed for {filename}")
+            print_error(f"Translation failed for [bold bright_yellow]{filename}[/bold bright_yellow]")
 
         # Keep keys in translations.json neatly ordered by page number
         ordered_results = {

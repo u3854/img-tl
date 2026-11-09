@@ -18,6 +18,7 @@ from common import (
     resolve_language,
     format_duration,
     SessionTracker,
+    RichArgumentParser,
     print_banner,
     print_step_header,
     preview_replacements,
@@ -163,8 +164,12 @@ def edit_image_via_comfy(
     return Image.open(io.BytesIO(img_resp.content)).convert("RGB")
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Batch edit comic pages via ComfyUI API using an exported workflow JSON."
+    parser = RichArgumentParser(
+        prog="edit_comics_comfy.py",
+        description="Surgically inpaint translated comic text using ComfyUI API and an exported workflow JSON.",
+        epilog="""[bold cyan]uv run python edit_comics_comfy.py "comics/ch01/translations.json" "qwen21-gguf.json" --lang japanese[/bold cyan]
+[bold cyan]uv run python edit_comics_comfy.py "comics/ch01" -w "qwen21-gguf.json" --delay 60[/bold cyan]
+[bold cyan]uv run python edit_comics_comfy.py "comics/ch01" -w "qwen21-gguf.json" --export-prompts --export-only[/bold cyan]"""
     )
     parser.add_argument(
         "translations_file",
@@ -411,8 +416,11 @@ def main():
         api_start = time.perf_counter()
         edited_successfully = False
 
-        status_msg = f"Editing [bold magenta]{filename}[/bold magenta] via ComfyUI ({workflow_path.name})..."
-        with console.status(f"[bold magenta]{status_msg}[/bold magenta]", spinner="dots"):
+        with console.status(
+            f"  [bold bright_magenta]Processing via ComfyUI[/bold bright_magenta] [bold bright_yellow]{filename}[/bold bright_yellow] [dim]({workflow_path.name})...[/dim]",
+            spinner="dots",
+            spinner_style="bold bright_magenta"
+        ):
             for attempt in range(1, args.retries + 2):
                 try:
                     edited_img = edit_image_via_comfy(
@@ -432,10 +440,10 @@ def main():
                     break
                 except (requests.exceptions.RequestException, RuntimeError, TimeoutError) as e:
                     if attempt <= args.retries:
-                        print_warning(f"Request failed (Attempt {attempt}/{args.retries + 1}): {e}. Retrying in {int(RETRY_DELAY)}s...")
+                        print_warning(f"Request failed (Attempt [bold]{attempt}/{args.retries + 1}[/bold]): {e}. Retrying in {int(RETRY_DELAY)}s...")
                         time.sleep(RETRY_DELAY)
                     else:
-                        print_error(f"Failed after {args.retries + 1} attempts: {e}")
+                        print_error(f"Failed after [bold]{args.retries + 1}[/bold] attempts: {e}")
                 except Exception as e:
                     print_error(f"Unexpected error on {filename}: {e}")
                     break
@@ -445,7 +453,7 @@ def main():
 
         if edited_successfully:
             remaining_edits -= 1
-            print_success(f"Image edited and saved in {format_duration(api_elapsed)} ({len(dialogues)} text replacements)")
+            print_success(f"Image edited and saved in [bold white]{format_duration(api_elapsed)}[/bold white] ([bold cyan]{len(dialogues)}[/bold cyan] text replacements)")
             tracker.record_step(api_time=api_elapsed, cycle_time=cycle_elapsed, success=True)
 
             projected_sec, finish_clock = tracker.estimate_remaining(inter_item_delay=args.delay)

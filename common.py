@@ -1,6 +1,7 @@
 import re
 import sys
 import time
+import argparse
 from pathlib import Path
 from typing import Union, Any, Optional
 from datetime import datetime, timedelta
@@ -24,6 +25,18 @@ from rich.table import Table
 from rich.rule import Rule
 from rich.live import Live
 from rich.text import Text
+from rich import box
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+    BarColumn,
+    TimeRemainingColumn,
+)
+from rich.traceback import install as install_rich_traceback
+
+# Install rich traceback handler for beautiful, readable exception traces
+install_rich_traceback(show_locals=False, extra_lines=1)
 
 # ==============================================================================
 # CONFIGURATION & SERVER DEFAULTS
@@ -67,7 +80,8 @@ DEFAULT_COMFY_DELAY = 120.0     # Default delay in seconds between ComfyUI calls
 
 # ==============================================================================
 
-console = Console()
+# Use legacy_windows=False to ensure true Unicode rounded corners (╭─╮, ╰─╯) and glyphs
+console = Console(legacy_windows=False)
 
 # --- Common Constants ---
 
@@ -90,6 +104,30 @@ TYPE_STYLES = {
     "thought": "bold magenta",
     "narration": "bold yellow",
     "sfx": "bold green",
+}
+
+TYPE_BADGES = {
+    "speech": "[bold cyan]🗣 Speech[/bold cyan]",
+    "thought": "[bold magenta]💭 Thought[/bold magenta]",
+    "narration": "[bold yellow]📜 Narration[/bold yellow]",
+    "sfx": "[bold green]⚡ SFX[/bold green]",
+}
+
+FIELD_ICONS = {
+    "input folder": "📁",
+    "image folder": "📁",
+    "source json": "📄",
+    "workflow json": "🧩",
+    "output file": "💾",
+    "output folder": "📂",
+    "language": "🌐",
+    "queue size": "📊",
+    "context memory": "🧠",
+    "settings": "⚙️",
+    "model settings": "⚙️",
+    "constraints": "⏱️",
+    "comfyui url": "🔌",
+    "workflow nodes": "🔗",
 }
 
 
@@ -245,23 +283,123 @@ class SessionTracker:
         return time.perf_counter() - self.session_start
 
 
+# --- Custom Rich Argument Parser ---
+
+class RichArgumentParser(argparse.ArgumentParser):
+    """An argparse.ArgumentParser subclass that renders rich, modern help and error messages."""
+
+    def error(self, message: str):
+        console.print()
+        console.print(f"  [bold bright_red]✖ Argument Error:[/bold bright_red] [white]{message}[/white]")
+        console.print(f"\n  [dim]Tip: Run with [bold bright_cyan]--help[/bold bright_cyan] to inspect all options and usage examples.[/dim]\n")
+        sys.exit(2)
+
+    def print_help(self, file=None):
+        console.print()
+
+        desc = (self.description or "").strip()
+        usage_text = self.format_usage().strip()
+        if usage_text.startswith("usage: "):
+            usage_text = usage_text[7:]
+
+        header_lines = []
+        if desc:
+            header_lines.append(f"[bold bright_white]{desc}[/bold bright_white]")
+            header_lines.append("")
+        header_lines.append(f"[dim]Usage:[/dim] [bold cyan]{usage_text}[/bold cyan]")
+
+        console.print(Panel(
+            "\n".join(header_lines),
+            title=f"[bold bright_cyan] ⚙️  {self.prog} [/bold bright_cyan]",
+            box=box.ROUNDED,
+            border_style="bright_blue",
+            padding=(1, 2)
+        ))
+
+        pos_actions = [a for a in self._actions if not a.option_strings and a.dest != "help"]
+        if pos_actions:
+            pos_table = Table(
+                box=box.ROUNDED,
+                border_style="dim blue",
+                show_header=True,
+                header_style="bold bright_cyan",
+                title="[bold bright_white]Positional Arguments[/bold bright_white]",
+                title_justify="left",
+                pad_edge=True,
+                padding=(0, 1)
+            )
+            pos_table.add_column("Argument", style="bold bright_yellow", width=20)
+            pos_table.add_column("Description", style="white")
+            for a in pos_actions:
+                pos_table.add_row(a.dest, a.help or "")
+            console.print()
+            console.print(pos_table)
+
+        opt_actions = [a for a in self._actions if a.option_strings and a.dest != "help"]
+        if opt_actions:
+            opt_table = Table(
+                box=box.ROUNDED,
+                border_style="dim blue",
+                show_header=True,
+                header_style="bold bright_cyan",
+                title="[bold bright_white]Options & Flags[/bold bright_white]",
+                title_justify="left",
+                pad_edge=True,
+                padding=(0, 1)
+            )
+            opt_table.add_column("Option Flag(s)", style="bold cyan", width=22)
+            opt_table.add_column("Default", style="dim", max_width=32, overflow="fold")
+            opt_table.add_column("Description", style="white")
+            for a in opt_actions:
+                flags = ", ".join(a.option_strings)
+                default_val = str(a.default) if a.default is not None and a.default != argparse.SUPPRESS else ""
+                if a.const is True:
+                    default_val = "False"
+
+                help_desc = a.help or ""
+                if a.choices:
+                    choices_str = ", ".join(str(c) for c in a.choices)
+                    help_desc += f" [dim](choices: {choices_str})[/dim]"
+
+                opt_table.add_row(flags, f"[dim]{default_val}[/dim]" if default_val else "-", help_desc)
+            console.print()
+            console.print(opt_table)
+
+        if self.epilog:
+            console.print()
+            console.print(Panel(
+                self.epilog.strip(),
+                title="[bold bright_white] 💡 Quick Examples [/bold bright_white]",
+                border_style="dim cyan",
+                box=box.ROUNDED,
+                padding=(1, 2)
+            ))
+
+        console.print()
+
+
 # --- UI & Display Helpers ---
 
 def print_banner(title: str, subtitle: str, fields: dict[str, Any], border_style: str = "bright_blue"):
-    """Displays a clean configuration panel at the start of a run."""
-    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2))
-    table.add_column("Field", style="bold white")
+    """Displays an elegant, informative startup panel."""
+    table = Table.grid(padding=(0, 2))
+    table.add_column("Field", style="bold white", justify="right")
     table.add_column("Value", style="cyan")
 
     for key, value in fields.items():
-        table.add_row(f"{key}:", str(value))
+        icon = FIELD_ICONS.get(key.lower(), "•")
+        val_str = str(value)
+        val_str = val_str.replace("Enabled", "[bold bright_green]Enabled[/bold bright_green]")
+        val_str = val_str.replace("Disabled", "[dim yellow]Disabled[/dim yellow]")
+        table.add_row(f"{icon} {key}:", val_str)
 
     panel = Panel(
         table,
-        title=f"[bold white]{title}[/bold white]",
-        subtitle=f"[dim]{subtitle}[/dim]" if subtitle else None,
+        title=f"[bold bright_white] {title} [/bold bright_white]",
+        subtitle=f"[dim italic] {subtitle} [/dim italic]" if subtitle else None,
         border_style=border_style,
-        padding=(1, 2)
+        box=box.ROUNDED,
+        padding=(1, 3)
     )
     console.print()
     console.print(panel)
@@ -277,75 +415,90 @@ def print_step_header(
     extra: str = ""
 ):
     """Prints a styled divider rule marking the current page being processed."""
-    pos_str = f"Page {overall_pos}/{overall_total} | " if (overall_pos and overall_total) else ""
-    extra_str = f" {extra}" if extra else ""
-    header_text = f"[bold white]Queue {queue_pos}/{queue_total}[/bold white] │ {pos_str}[bold yellow]{filename}[/bold yellow]{extra_str}"
-    console.print(Rule(title=header_text, style="dim white", align="left"))
+    pct = int((queue_pos / queue_total) * 100) if queue_total > 0 else 0
+    pos_badge = f"[dim](Page {overall_pos}/{overall_total})[/dim] " if (overall_pos and overall_total) else ""
+    extra_badge = f" [dim]{extra}[/dim]" if extra else ""
+
+    header_text = (
+        f" [bold bright_cyan]Queue {queue_pos}/{queue_total}[/bold bright_cyan] "
+        f"[dim]({pct}%)[/dim] │ "
+        f"{pos_badge}"
+        f"[bold bright_yellow]📄 {filename}[/bold bright_yellow]"
+        f"{extra_badge} "
+    )
+    console.print()
+    console.print(Rule(title=header_text, style="cyan", characters="─", align="left"))
 
 
-def preview_dialogues(dialogues: list[dict], max_items: int = 5):
-    """Renders a preview table of translated dialogues."""
+def preview_dialogues(dialogues: list[dict], max_items: int = 6):
+    """Renders an attractive, well-aligned preview table of translated dialogues."""
     if not dialogues:
-        console.print("  [dim italic](No dialogue or text detected on this page)[/dim italic]")
+        console.print("  [dim italic]💬 No story dialogue or narration detected on this page[/dim italic]")
         return
 
     table = Table(
-        box=None,
-        show_header=True,
-        header_style="bold dim",
-        pad_edge=False,
-        padding=(0, 2)
+        box=box.ROUNDED,
+        border_style="dim blue",
+        header_style="bold bright_cyan",
+        show_lines=False,
+        pad_edge=True,
+        padding=(0, 1),
     )
-    table.add_column("#", style="dim", justify="right", width=3)
-    table.add_column("Type", width=11)
-    table.add_column("Original", style="dim", max_width=35, overflow="ellipsis")
-    table.add_column("Translation", style="white", max_width=45, overflow="ellipsis")
+    table.add_column("#", style="dim", justify="center", width=3)
+    table.add_column("Type", width=14, justify="left")
+    table.add_column("Original Text", style="dim italic", max_width=40, overflow="fold")
+    table.add_column("English Translation", style="bold white", max_width=50, overflow="fold")
 
     display_items = dialogues[:max_items]
     for idx, item in enumerate(display_items, start=1):
         dtype = item.get("type", "speech").strip().lower()
-        color = TYPE_STYLES.get(dtype, "white")
+        badge = TYPE_BADGES.get(dtype, f"[white]● {dtype.capitalize()}[/white]")
         orig = item.get("original", "").strip().replace("\n", " ")
         trans = item.get("translation", "").strip().replace("\n", " ")
-        table.add_row(str(idx), f"[{color}]{dtype}[/{color}]", orig, trans)
+        table.add_row(str(idx), badge, orig, trans)
 
     console.print(table)
     if len(dialogues) > max_items:
-        console.print(f"  [dim]... and {len(dialogues) - max_items} more text items[/dim]")
+        console.print(f"  [dim italic]... and {len(dialogues) - max_items} more items saved to JSON[/dim italic]")
 
 
-def preview_replacements(dialogues: list[dict], max_items: int = 5):
-    """Renders a preview list of text replacements for inpainting."""
+def preview_replacements(dialogues: list[dict], max_items: int = 6):
+    """Renders a preview table of text replacements for inpainting."""
     if not dialogues:
-        console.print("  [dim italic](No dialogue replacements)[/dim italic]")
+        console.print("  [dim italic]ℹ No dialogue replacements needed for this page[/dim italic]")
         return
 
     table = Table(
-        box=None,
-        show_header=True,
-        header_style="bold dim",
-        pad_edge=False,
-        padding=(0, 2)
+        box=box.ROUNDED,
+        border_style="dim magenta",
+        header_style="bold bright_magenta",
+        show_lines=False,
+        pad_edge=True,
+        padding=(0, 1),
     )
-    table.add_column("#", style="dim", justify="right", width=3)
-    table.add_column("Type", width=11)
-    table.add_column("Original ➔ Replacement", style="white", max_width=75, overflow="ellipsis")
+    table.add_column("#", style="dim", justify="center", width=3)
+    table.add_column("Type", width=14, justify="left")
+    table.add_column("Original Text", style="dim italic", max_width=35, overflow="fold")
+    table.add_column("", justify="center", width=3)
+    table.add_column("Inpaint Replacement", style="bold white", max_width=45, overflow="fold")
 
     display_items = dialogues[:max_items]
     for idx, item in enumerate(display_items, start=1):
         dtype = item.get("type", "speech").strip().lower()
-        color = TYPE_STYLES.get(dtype, "white")
+        badge = TYPE_BADGES.get(dtype, f"[white]● {dtype.capitalize()}[/white]")
         orig = item.get("original", "").strip().replace("\n", " ")
         trans = item.get("translation", "").strip().replace("\n", " ")
         table.add_row(
             str(idx),
-            f"[{color}]{dtype}[/{color}]",
-            f'[dim]"{orig}"[/dim]  [bold bright_green]➔[/bold bright_green]  [white]"{trans}"[/white]'
+            badge,
+            orig,
+            "[bold bright_green]➔[/bold bright_green]",
+            trans
         )
 
     console.print(table)
     if len(dialogues) > max_items:
-        console.print(f"  [dim]... and {len(dialogues) - max_items} more replacements[/dim]")
+        console.print(f"  [dim italic]... and {len(dialogues) - max_items} more inpaint replacements scheduled[/dim italic]")
 
 
 def countdown_delay(delay_seconds: float):
@@ -354,17 +507,25 @@ def countdown_delay(delay_seconds: float):
         return
 
     int_delay = int(round(delay_seconds))
-    with Live(console=console, transient=True, refresh_per_second=4) as live:
-        for remaining in range(int_delay, 0, -1):
-            bar_pct = (int_delay - remaining) / int_delay
-            filled = int(bar_pct * 15)
-            bar = f"[{'━' * filled}{'─' * (15 - filled)}]"
-            live.update(
-                Text.from_markup(
-                    f"  [dim]⏳ Cooldown delay {bar} [bold white]{remaining}s[/bold white] remaining (Ctrl+C to stop)[/dim]"
-                )
-            )
-            time.sleep(1)
+    with Progress(
+        SpinnerColumn(spinner_name="clock", style="bold bright_cyan"),
+        TextColumn("[bold bright_cyan]Cooldown Delay[/bold bright_cyan]"),
+        BarColumn(bar_width=22, style="dim white", complete_style="bright_cyan", finished_style="bright_green"),
+        TextColumn("[bold white]{task.fields[rem]:.0f}s[/bold white] remaining"),
+        TextColumn("[dim]• Ctrl+C to pause/stop[/dim]"),
+        console=console,
+        transient=True,
+        refresh_per_second=10,
+    ) as progress:
+        task_id = progress.add_task("cooldown", total=delay_seconds, rem=delay_seconds)
+        start_t = time.perf_counter()
+        while True:
+            elapsed = time.perf_counter() - start_t
+            rem = max(0.0, delay_seconds - elapsed)
+            progress.update(task_id, completed=elapsed, rem=rem)
+            if rem <= 0.05:
+                break
+            time.sleep(0.1)
 
 
 def print_stats(
@@ -377,15 +538,15 @@ def print_stats(
 ):
     """Prints a consistent, compact timing and ETA line."""
     if remaining_items > 0:
-        eta_part = f" │ [bold]Left:[/bold] {remaining_items} (~{format_duration(projected_seconds)}, [bold cyan]ETA {eta_clock}[/bold cyan])"
+        eta_part = f"[dim]⏳ Left:[/dim] [bold bright_yellow]{remaining_items}p[/bold bright_yellow] [dim](~{format_duration(projected_seconds)})[/dim]  [dim]•[/dim]  [dim]🎯 ETA:[/dim] [bold bright_cyan]{eta_clock}[/bold bright_cyan]"
     else:
-        eta_part = " │ [bold green]Queue completed![/bold green]"
+        eta_part = "[bold bright_green]✔ Queue complete![/bold bright_green]"
 
     console.print(
-        f"  [dim]⏱[/dim] [bold]API:[/bold] {format_duration(api_duration)} │ "
-        f"[bold]Total:[/bold] {format_duration(cycle_duration)} │ "
-        f"[bold]Session Avg:[/bold] {format_duration(avg_cycle)}/page"
-        f"{eta_part}"
+        f"  [dim]⏱  API:[/dim] [bold white]{format_duration(api_duration)}[/bold white]  "
+        f"[dim]•[/dim]  [dim]⚡ Step:[/dim] [bold white]{format_duration(cycle_duration)}[/bold white]  "
+        f"[dim]•[/dim]  [dim]📊 Avg:[/dim] [bold white]{format_duration(avg_cycle)}/p[/bold white]  "
+        f"[dim]•[/dim]  {eta_part}"
     )
 
 
@@ -400,29 +561,37 @@ def print_summary(
     border_style: str = "bright_green"
 ):
     """Displays a closing summary panel with stats and destination."""
-    table = Table(box=None, show_header=False, pad_edge=False, padding=(0, 2))
-    table.add_column("Metric", style="bold white")
+    table = Table.grid(padding=(0, 2))
+    table.add_column("Key", style="bold white", justify="right")
     table.add_column("Value", style="cyan")
 
-    table.add_row("Total Processed:", str(total_processed))
-    table.add_row("Successful:", f"[bold green]{successful}[/bold green]")
+    table.add_row("📊 Total Processed:", f"[bold white]{total_processed}[/bold white] pages")
+    table.add_row("✔ Successful:", f"[bold bright_green]{successful}[/bold bright_green]")
     if failed > 0:
-        table.add_row("Failed:", f"[bold red]{failed}[/bold red]")
-    table.add_row("Total Session Time:", format_duration(total_time))
+        table.add_row("✖ Failed:", f"[bold bright_red]{failed}[/bold bright_red]")
+        border_style = "bright_yellow" if successful > 0 else "bright_red"
+    else:
+        table.add_row("✖ Failed:", "[dim]0[/dim]")
+
+    pct = int((successful / total_processed) * 100) if total_processed > 0 else 100
+    table.add_row("🎯 Success Rate:", f"[bold bright_green]{pct}%[/bold bright_green]")
+    table.add_row("⏱ Total Duration:", f"[bold cyan]{format_duration(total_time)}[/bold cyan]")
+
     avg_time = (total_time / total_processed) if total_processed > 0 else 0
-    table.add_row("Average per Page:", f"{format_duration(avg_time)}/page")
+    table.add_row("⚡ Average Throughput:", f"{format_duration(avg_time)} / page")
 
     if extras:
         for k, v in extras.items():
-            table.add_row(f"{k}:", str(v))
+            table.add_row(f"⚙️ {k}:", str(v))
 
-    table.add_row("Saved Output:", str(output_path))
+    table.add_row("💾 Saved Output:", f"[bold bright_cyan]{output_path}[/bold bright_cyan]")
 
     panel = Panel(
         table,
-        title=f"[bold white]{title}[/bold white]",
+        title=f"[bold bright_white] {title} [/bold bright_white]",
         border_style=border_style,
-        padding=(1, 2)
+        box=box.ROUNDED,
+        padding=(1, 3)
     )
     console.print()
     console.print(panel)
@@ -430,16 +599,16 @@ def print_summary(
 
 
 def print_info(msg: str):
-    console.print(f"[bold blue]ℹ[/bold blue] {msg}")
+    console.print(f"  [bold bright_cyan]ℹ[/bold bright_cyan]  {msg}")
 
 
 def print_success(msg: str):
-    console.print(f"[bold green]✔[/bold green] {msg}")
+    console.print(f"  [bold bright_green]✔[/bold bright_green]  {msg}")
 
 
 def print_warning(msg: str):
-    console.print(f"[bold yellow]⚠[/bold yellow] {msg}")
+    console.print(f"  [bold bright_yellow]▲[/bold bright_yellow]  {msg}")
 
 
 def print_error(msg: str):
-    console.print(f"[bold red]✖[/bold red] {msg}")
+    console.print(f"  [bold bright_red]✖[/bold bright_red]  {msg}")
