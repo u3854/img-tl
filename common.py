@@ -23,15 +23,12 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.rule import Rule
-from rich.live import Live
-from rich.text import Text
 from rich import box
 from rich.progress import (
     Progress,
     SpinnerColumn,
     TextColumn,
     BarColumn,
-    TimeRemainingColumn,
 )
 from rich.traceback import install as install_rich_traceback
 
@@ -55,7 +52,7 @@ DEFAULT_SD_API_URL = f"{DEFAULT_HOST}:{DEFAULT_SD_PORT}/v1/images/edits"
 DEFAULT_COMFY_API_URL = f"{DEFAULT_HOST}:{DEFAULT_COMFY_PORT}"
 
 # Network & Operational Defaults
-DEFAULT_DELAY = 60.0       # Delay in seconds between API calls
+DEFAULT_DELAY = 120.0       # Delay in seconds between API calls
 DEFAULT_TIMEOUT = 600      # Request timeout in seconds
 DEFAULT_RETRIES = 2        # Retry attempts on network/timeout errors
 RETRY_DELAY = 10.0         # Cooldown in seconds before a retry attempt

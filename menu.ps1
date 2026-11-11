@@ -10,54 +10,6 @@
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # ==============================================================================
-# RESOLVE PACKAGE DIRECTORY (DYNAMICALLY DETECTED - NO HARDCODED PATHS)
-# ==============================================================================
-$ScriptDir = if ($PSScriptRoot) {
-    $PSScriptRoot
-} elseif ($MyInvocation.MyCommand.Path) {
-    Split-Path -Parent $MyInvocation.MyCommand.Path
-} else {
-    $PWD.Path
-}
-
-$ScriptDir = (Resolve-Path $ScriptDir).Path
-
-if (-not (Test-Path (Join-Path $ScriptDir "common.py"))) {
-    Write-Host "`n  [ERROR] common.py not found in '$ScriptDir'." -ForegroundColor Red
-    Write-Host "  Please ensure menu.ps1 is executed from or located within the project repository.`n" -ForegroundColor Yellow
-}
-
-$StateFile = Join-Path $ScriptDir ".menu_state.json"
-
-# ==============================================================================
-# STATE MANAGEMENT
-# ==============================================================================
-function Get-SavedState {
-    if (Test-Path $StateFile) {
-        try {
-            $json = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-            return $json
-        } catch {}
-    }
-    return [PSCustomObject]@{
-        LastComicFolder    = ""
-        LastWorkflowFile   = (Join-Path $ScriptDir "qwen21-gguf.json")
-        LastLanguage       = "chinese"
-        LastThinkingEffort = "low"
-        LastDelay          = 60
-    }
-}
-
-function Save-SavedState {
-    param($State)
-    try {
-        $State | ConvertTo-Json -Depth 4 | Set-Content -Path $StateFile -Encoding UTF8
-    } catch {}
-}
-
-$Global:State = Get-SavedState
-
-# ==============================================================================
 # NATIVE WINDOWS PICKERS (STA SAFE & TOPMOST)
 # ==============================================================================
 function Invoke-InSTA {
@@ -119,8 +71,10 @@ function Select-WindowsFolder {
 
     if ($selected) {
         Write-Host "  [✓] Selected folder: $selected" -ForegroundColor Green
-        $Global:State.LastComicFolder = $selected
-        Save-SavedState $Global:State
+        if ($Global:State) {
+            $Global:State.LastComicFolder = $selected
+            Save-SavedState $Global:State
+        }
         return $selected
     } else {
         Write-Host "  [!] Folder selection cancelled." -ForegroundColor Yellow
@@ -178,6 +132,94 @@ function Select-WindowsFile {
         return $null
     }
 }
+
+# ==============================================================================
+# RESOLVE PACKAGE DIRECTORY (DYNAMICALLY DETECTED - NO HARDCODED PATHS)
+# ==============================================================================
+$UserConfigFile = Join-Path $HOME ".img_tl_config.json"
+
+function Resolve-PackageDir {
+    # 1. Standard repo root detection (script inside repo)
+    $candidate = if ($PSScriptRoot) {
+        $PSScriptRoot
+    } elseif ($MyInvocation.MyCommand.Path) {
+        Split-Path -Parent $MyInvocation.MyCommand.Path
+    } else {
+        $PWD.Path
+    }
+
+    if ($candidate -and (Test-Path (Join-Path $candidate "common.py"))) {
+        return (Resolve-Path $candidate).Path
+    }
+
+    # 2. Check environment variable
+    if ($env:IMG_TL_DIR -and (Test-Path (Join-Path $env:IMG_TL_DIR "common.py"))) {
+        return (Resolve-Path $env:IMG_TL_DIR).Path
+    }
+
+    # 3. Check persistent user config file (~/.img_tl_config.json)
+    if (Test-Path $UserConfigFile) {
+        try {
+            $cfg = Get-Content $UserConfigFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($cfg.PackageDir -and (Test-Path (Join-Path $cfg.PackageDir "common.py"))) {
+                return (Resolve-Path $cfg.PackageDir).Path
+            }
+        } catch {}
+    }
+
+    # 4. If script was copied outside repo (e.g. C:\Shortcuts), prompt user with Windows Folder Picker once!
+    Write-Host "`n  [i] 'common.py' not found in '$candidate'." -ForegroundColor Yellow
+    Write-Host "  Please select your 'img-tl' repository folder using the Windows folder picker..." -ForegroundColor Cyan
+
+    $picked = Select-WindowsFolder -Title "Select 'img-tl' Repository Folder"
+    if ($picked -and (Test-Path (Join-Path $picked "common.py"))) {
+        $cleanPath = (Resolve-Path $picked).Path
+        try {
+            [PSCustomObject]@{ PackageDir = $cleanPath } | ConvertTo-Json | Set-Content -Path $UserConfigFile -Encoding UTF8
+            Write-Host "  [✓] Repository location saved to $UserConfigFile" -ForegroundColor Green
+        } catch {}
+        return $cleanPath
+    }
+
+    Write-Host "`n  [ERROR] Could not locate the 'img-tl' repository." -ForegroundColor Red
+    return $null
+}
+
+$ScriptDir = Resolve-PackageDir
+if (-not $ScriptDir) {
+    Write-Host "  Exiting.`n" -ForegroundColor Red
+    exit 1
+}
+
+$StateFile = Join-Path $ScriptDir ".menu_state.json"
+
+# ==============================================================================
+# STATE MANAGEMENT
+# ==============================================================================
+function Get-SavedState {
+    if (Test-Path $StateFile) {
+        try {
+            $json = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            return $json
+        } catch {}
+    }
+    return [PSCustomObject]@{
+        LastComicFolder    = ""
+        LastWorkflowFile   = (Join-Path $ScriptDir "qwen21-gguf.json")
+        LastLanguage       = "chinese"
+        LastThinkingEffort = "low"
+        LastDelay          = 60
+    }
+}
+
+function Save-SavedState {
+    param($State)
+    try {
+        $State | ConvertTo-Json -Depth 4 | Set-Content -Path $StateFile -Encoding UTF8
+    } catch {}
+}
+
+$Global:State = Get-SavedState
 
 # ==============================================================================
 # SCRIPT EXECUTION ENGINE
@@ -590,6 +632,7 @@ function Action-TestServers {
             $resp.Close()
         } catch [System.Net.WebException] {
             if ($_.Response -ne $null) {
+                # Got HTTP response (even 404/405 means port is listening)
                 Write-Host "[ LISTENING ]" -ForegroundColor Green
             } else {
                 Write-Host "[ OFFLINE ]" -ForegroundColor Red
