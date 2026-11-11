@@ -3,3 +3,4 @@ __pycache__
 *.txt
 
 qwen21-gguf.json
+.menu_state.json

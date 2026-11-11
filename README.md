@@ -9,6 +9,25 @@ Ensure dependencies are installed:
 uv sync
 ```
 
+## Quick Start: Interactive Menu Launcher
+
+You can run the full pipeline interactively from anywhere using the PowerShell menu launcher with native Windows file/folder pickers:
+
+```powershell
+# Run from PowerShell (works from any working directory)
+pwsh "path/to/img-tl/menu.ps1"
+# or with Windows PowerShell 5.1:
+powershell -ExecutionPolicy Bypass -File "path/to/img-tl/menu.ps1"
+```
+Or simply double-click **[`run_menu.bat`](run_menu.bat)** in Windows Explorer!
+
+Features:
+- **Native Windows GUI Pickers**: Pick comic folders, JSON translation files, and ComfyUI workflow JSONs via standard Windows dialogs.
+- **Run From Anywhere**: Automatically resolves the package directory and uses `uv` or local virtual environment.
+- **Workflow Memory**: Automatically remembers your last selected comic folder and ComfyUI workflow across sessions.
+- **Full End-to-End Pipelines**: Chain Translation and ComfyUI / SD inpainting back-to-back.
+- **Server Health Check**: Verify if llama-server, ComfyUI, and SD servers are online and responsive.
+
 ---
 
 ## Configuration & Server Defaults

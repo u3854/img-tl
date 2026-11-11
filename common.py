@@ -291,7 +291,7 @@ class RichArgumentParser(argparse.ArgumentParser):
     def error(self, message: str):
         console.print()
         console.print(f"  [bold bright_red]✖ Argument Error:[/bold bright_red] [white]{message}[/white]")
-        console.print(f"\n  [dim]Tip: Run with [bold bright_cyan]--help[/bold bright_cyan] to inspect all options and usage examples.[/dim]\n")
+        console.print("\n  [dim]Tip: Run with [bold bright_cyan]--help[/bold bright_cyan] to inspect all options and usage examples.[/dim]\n")
         sys.exit(2)
 
     def print_help(self, file=None):
@@ -506,7 +506,7 @@ def countdown_delay(delay_seconds: float):
     if delay_seconds <= 0:
         return
 
-    int_delay = int(round(delay_seconds))
+    _int_delay = int(round(delay_seconds))
     with Progress(
         SpinnerColumn(spinner_name="clock", style="bold bright_cyan"),
         TextColumn("[bold bright_cyan]Cooldown Delay[/bold bright_cyan]"),
