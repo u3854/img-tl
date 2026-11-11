@@ -3,7 +3,7 @@
     Interactive Launcher & Workflow Menu for Comic Translation & Inpainting Pipeline.
 .DESCRIPTION
     Runs from anywhere on the system. Uses native Windows GUI pickers for file/folder selection.
-    Orchestrates llama-translate.py, edit_comics.py, and edit_comics_comfy.py with uv or python.
+    Dynamically reads default settings from common.py and orchestrates pipeline scripts.
 #>
 
 # Enable UTF-8 console output for beautiful unicode characters
@@ -191,6 +191,112 @@ if (-not $ScriptDir) {
     exit 1
 }
 
+# ==============================================================================
+# DYNAMIC DEFAULTS EXTRACTOR (FROM common.py)
+# ==============================================================================
+function Get-PipelineDefaults {
+    param([string]$RepoDir)
+
+    $commonPy = Join-Path $RepoDir "common.py"
+    if (-not (Test-Path $commonPy)) {
+        return [PSCustomObject]@{
+            DEFAULT_LANGUAGE        = "chinese"
+            DEFAULT_DELAY           = 120.0
+            DEFAULT_COMFY_DELAY     = 120.0
+            DEFAULT_THINKING_EFFORT = "low"
+            DEFAULT_THINKING_BUDGET = 1024
+            DEFAULT_STEPS           = 4
+            DEFAULT_CFG             = 1.0
+            DEFAULT_MAX_SIDE        = 1280
+            DEFAULT_SAMPLER         = "euler"
+            DEFAULT_SCHEDULER       = "simple"
+            DEFAULT_HOST            = "http://localhost"
+            DEFAULT_LLAMA_PORT      = 8080
+            DEFAULT_SD_PORT         = 8080
+            DEFAULT_COMFY_PORT      = 8188
+            DEFAULT_LLAMA_API_URL   = "http://localhost:8080/v1/chat/completions"
+            DEFAULT_SD_API_URL      = "http://localhost:8080/v1/images/edits"
+            DEFAULT_COMFY_API_URL   = "http://localhost:8188"
+            DEFAULT_OUTPUT_FILENAME = "translations.json"
+            DEFAULT_OUTPUT_DIR      = "edited"
+            DEFAULT_EXPORT_FILENAME = "prompts.txt"
+            DEFAULT_TIMEOUT         = 600
+            DEFAULT_RETRIES         = 2
+        }
+    }
+
+    # 1. Fast Python introspection via .venv or uv
+    $venvPy = Join-Path $RepoDir ".venv\Scripts\python.exe"
+    $uvExe = Get-Command "uv" -ErrorAction SilentlyContinue
+    $pyCode = "import common, json; d = {k: getattr(common, k) for k in dir(common) if k.startswith(`"DEFAULT_`")}; print(json.dumps(d))"
+
+    $jsonRaw = $null
+    if (Test-Path $venvPy) {
+        try {
+            $jsonRaw = & "$venvPy" -c $pyCode 2>$null
+        } catch {}
+    } elseif ($uvExe) {
+        try {
+            $jsonRaw = & $uvExe.Source run --project "$RepoDir" python -c $pyCode 2>$null
+        } catch {}
+    }
+
+    if ($jsonRaw) {
+        try {
+            $obj = $jsonRaw | ConvertFrom-Json
+            if ($obj.DEFAULT_LANGUAGE) { return $obj }
+        } catch {}
+    }
+
+    # 2. Fast regex fallback directly from common.py
+    $map = @{
+        DEFAULT_LANGUAGE        = "chinese"
+        DEFAULT_DELAY           = 60.0
+        DEFAULT_COMFY_DELAY     = 120.0
+        DEFAULT_THINKING_EFFORT = "low"
+        DEFAULT_THINKING_BUDGET = 1024
+        DEFAULT_STEPS           = 4
+        DEFAULT_CFG             = 1.0
+        DEFAULT_MAX_SIDE        = 1280
+        DEFAULT_SAMPLER         = "euler"
+        DEFAULT_SCHEDULER       = "simple"
+        DEFAULT_HOST            = "http://localhost"
+        DEFAULT_LLAMA_PORT      = 8080
+        DEFAULT_SD_PORT         = 8080
+        DEFAULT_COMFY_PORT      = 8188
+        DEFAULT_OUTPUT_FILENAME = "translations.json"
+        DEFAULT_OUTPUT_DIR      = "edited"
+        DEFAULT_EXPORT_FILENAME = "prompts.txt"
+        DEFAULT_TIMEOUT         = 600
+        DEFAULT_RETRIES         = 2
+    }
+
+    Get-Content $commonPy -Encoding UTF8 | ForEach-Object {
+        if ($_ -match "^\s*(DEFAULT_[A-Z0-9_]+)\s*=\s*(.*)$") {
+            $k = $matches[1]
+            $v = $matches[2].Trim()
+            if ($v -match "^(.*?)\s*#.*$") { $v = $matches[1].Trim() }
+            if ($v -match "^[\x22\x27](.*)[\x22\x27]$") {
+                $map[$k] = $matches[1]
+            } elseif ($v -match "^-?\d+$") {
+                $map[$k] = [int]$v
+            } elseif ($v -match "^-?\d+\.\d+$") {
+                $map[$k] = [double]$v
+            }
+        }
+    }
+
+    $h = $map["DEFAULT_HOST"]
+    $map["DEFAULT_LLAMA_API_URL"] = "$h`:$($map.DEFAULT_LLAMA_PORT)/v1/chat/completions"
+    $map["DEFAULT_SD_API_URL"]    = "$h`:$($map.DEFAULT_SD_PORT)/v1/images/edits"
+    $map["DEFAULT_COMFY_API_URL"] = "$h`:$($map.DEFAULT_COMFY_PORT)"
+
+    return [PSCustomObject]$map
+}
+
+# Dynamically load defaults from common.py
+$Global:Defaults = Get-PipelineDefaults -RepoDir $ScriptDir
+
 $StateFile = Join-Path $ScriptDir ".menu_state.json"
 
 # ==============================================================================
@@ -200,15 +306,21 @@ function Get-SavedState {
     if (Test-Path $StateFile) {
         try {
             $json = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-            return $json
+            if ($json) {
+                # Ensure defaults fill in any missing fields
+                if (-not $json.LastLanguage) { $json | Add-Member -NotePropertyName "LastLanguage" -NotePropertyValue $Global:Defaults.DEFAULT_LANGUAGE -Force }
+                if (-not $json.LastThinkingEffort) { $json | Add-Member -NotePropertyName "LastThinkingEffort" -NotePropertyValue $Global:Defaults.DEFAULT_THINKING_EFFORT -Force }
+                if (-not $json.LastDelay) { $json | Add-Member -NotePropertyName "LastDelay" -NotePropertyValue $Global:Defaults.DEFAULT_DELAY -Force }
+                return $json
+            }
         } catch {}
     }
     return [PSCustomObject]@{
         LastComicFolder    = ""
         LastWorkflowFile   = (Join-Path $ScriptDir "qwen21-gguf.json")
-        LastLanguage       = "chinese"
-        LastThinkingEffort = "low"
-        LastDelay          = 60
+        LastLanguage       = $Global:Defaults.DEFAULT_LANGUAGE
+        LastThinkingEffort = $Global:Defaults.DEFAULT_THINKING_EFFORT
+        LastDelay          = $Global:Defaults.DEFAULT_DELAY
     }
 }
 
@@ -272,7 +384,11 @@ function Invoke-PipelineScript {
 # HELPER PROMPTS
 # ==============================================================================
 function Prompt-Language {
-    param([string]$DefaultLang = "chinese")
+    param([string]$DefaultLang = "")
+
+    if (-not $DefaultLang) {
+        $DefaultLang = $Global:Defaults.DEFAULT_LANGUAGE
+    }
 
     Write-Host "`n  Source Language:" -ForegroundColor White
     Write-Host "    [1] Chinese  (zh)" -ForegroundColor Cyan
@@ -335,12 +451,16 @@ function Action-Translate {
         Write-Host "  [i] Found $($images.Count) image page(s) in folder." -ForegroundColor Green
     }
 
-    $lang = Prompt-Language -DefaultLang $Global:State.LastLanguage
+    $activeLang = if ($Global:State.LastLanguage) { $Global:State.LastLanguage } else { $Global:Defaults.DEFAULT_LANGUAGE }
+    $lang = Prompt-Language -DefaultLang $activeLang
     $Global:State.LastLanguage = $lang
     Save-SavedState $Global:State
 
+    $defEffort = $Global:Defaults.DEFAULT_THINKING_EFFORT
+    $defDelay  = $Global:Defaults.DEFAULT_DELAY
+
     Write-Host "`n  Configuration Mode:" -ForegroundColor White
-    Write-Host "    [1] Quick Run (Recommended: Low thinking effort, 60s delay)" -ForegroundColor Green
+    Write-Host "    [1] Quick Run (Recommended: $defEffort thinking effort, ${defDelay}s delay)" -ForegroundColor Green
     Write-Host "    [2] Customize settings (Thinking effort, delay, skip errors, etc.)" -ForegroundColor Cyan
     $mode = Read-Host "  Choose mode [1/2] (Default: 1)"
     if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "1" }
@@ -349,13 +469,13 @@ function Action-Translate {
 
     if ($mode.Trim() -eq "2") {
         Write-Host "`n  Thinking Effort Level:" -ForegroundColor White
-        Write-Host "    [1] low (default)  [2] medium  [3] high  [4] none" -ForegroundColor Cyan
-        $eff = Read-Host "  Select effort [1-4] (Default: 1)"
+        Write-Host "    [1] low  [2] medium  [3] high  [4] none" -ForegroundColor Cyan
+        $effPrompt = Read-Host "  Select effort [1-4] (Default: $defEffort)"
         $effortMap = @{ "1"="low"; "2"="medium"; "3"="high"; "4"="none" }
-        $chosenEffort = if ($effortMap.ContainsKey($eff)) { $effortMap[$eff] } else { "low" }
+        $chosenEffort = if ($effortMap.ContainsKey($effPrompt)) { $effortMap[$effPrompt] } else { $defEffort }
         $argsList += @("--thinking-effort", $chosenEffort)
 
-        $delayInput = Read-Host "  Delay between API calls in seconds (Default: 60)"
+        $delayInput = Read-Host "  Delay between API calls in seconds (Default: $defDelay)"
         if ($delayInput -and [double]::TryParse($delayInput, [ref]$null)) {
             $argsList += @("--delay", $delayInput.Trim())
         }
@@ -422,13 +542,15 @@ function Action-InpaintComfy {
     $Global:State.LastWorkflowFile = $workflow
     Save-SavedState $Global:State
 
-    $lang = Prompt-Language -DefaultLang $Global:State.LastLanguage
+    $activeLang = if ($Global:State.LastLanguage) { $Global:State.LastLanguage } else { $Global:Defaults.DEFAULT_LANGUAGE }
+    $lang = Prompt-Language -DefaultLang $activeLang
     $Global:State.LastLanguage = $lang
     Save-SavedState $Global:State
 
+    $defComfyDelay = $Global:Defaults.DEFAULT_COMFY_DELAY
     Write-Host "`n  Options:" -ForegroundColor White
     $overwrite = Read-Host "  Overwrite existing images in 'edited\' subfolder? [y/N]"
-    $delayInput = Read-Host "  Delay between ComfyUI calls in seconds (Default: 120)"
+    $delayInput = Read-Host "  Delay between ComfyUI calls in seconds (Default: $defComfyDelay)"
 
     $argsList = @($targetInput, $workflow, "--lang", $lang)
     if ($overwrite -and $overwrite.Trim().ToLower() -eq "y") {
@@ -477,12 +599,18 @@ function Action-InpaintSD {
         }
     }
 
-    $lang = Prompt-Language -DefaultLang $Global:State.LastLanguage
+    $activeLang = if ($Global:State.LastLanguage) { $Global:State.LastLanguage } else { $Global:Defaults.DEFAULT_LANGUAGE }
+    $lang = Prompt-Language -DefaultLang $activeLang
     $Global:State.LastLanguage = $lang
     Save-SavedState $Global:State
 
+    $defSteps   = $Global:Defaults.DEFAULT_STEPS
+    $defCfg     = $Global:Defaults.DEFAULT_CFG
+    $defMaxSide = $Global:Defaults.DEFAULT_MAX_SIDE
+    $defDelay   = $Global:Defaults.DEFAULT_DELAY
+
     Write-Host "`n  Configuration Mode:" -ForegroundColor White
-    Write-Host "    [1] Quick Run (Steps: 4, CFG: 1.0, Max Side: 1280px, Delay: 60s)" -ForegroundColor Green
+    Write-Host "    [1] Quick Run (Steps: $defSteps, CFG: $defCfg, Max Side: ${defMaxSide}px, Delay: ${defDelay}s)" -ForegroundColor Green
     Write-Host "    [2] Customize parameters" -ForegroundColor Cyan
     $mode = Read-Host "  Choose mode [1/2] (Default: 1)"
     if ([string]::IsNullOrWhiteSpace($mode)) { $mode = "1" }
@@ -490,16 +618,16 @@ function Action-InpaintSD {
     $argsList = @($targetInput, "--lang", $lang)
 
     if ($mode.Trim() -eq "2") {
-        $steps = Read-Host "  Sampling steps (Default: 4 for Turbo)"
+        $steps = Read-Host "  Sampling steps (Default: $defSteps for Turbo)"
         if ($steps -and [int]::TryParse($steps, [ref]$null)) { $argsList += @("--steps", $steps.Trim()) }
 
-        $cfg = Read-Host "  CFG scale (Default: 1.0 for Turbo)"
+        $cfg = Read-Host "  CFG scale (Default: $defCfg for Turbo)"
         if ($cfg -and [double]::TryParse($cfg, [ref]$null)) { $argsList += @("--cfg", $cfg.Trim()) }
 
-        $maxSide = Read-Host "  Max image side in pixels (Default: 1280)"
+        $maxSide = Read-Host "  Max image side in pixels (Default: $defMaxSide)"
         if ($maxSide -and [int]::TryParse($maxSide, [ref]$null)) { $argsList += @("--max-side", $maxSide.Trim()) }
 
-        $delay = Read-Host "  Delay between edits in seconds (Default: 60)"
+        $delay = Read-Host "  Delay between edits in seconds (Default: $defDelay)"
         if ($delay -and [double]::TryParse($delay, [ref]$null)) { $argsList += @("--delay", $delay.Trim()) }
 
         $overwrite = Read-Host "  Overwrite existing images in 'edited\'? [y/N]"
@@ -533,7 +661,8 @@ function Action-PipelineComfy {
     $Global:State.LastWorkflowFile = $workflow
     Save-SavedState $Global:State
 
-    $lang = Prompt-Language -DefaultLang $Global:State.LastLanguage
+    $activeLang = if ($Global:State.LastLanguage) { $Global:State.LastLanguage } else { $Global:Defaults.DEFAULT_LANGUAGE }
+    $lang = Prompt-Language -DefaultLang $activeLang
     $Global:State.LastLanguage = $lang
     Save-SavedState $Global:State
 
@@ -565,7 +694,8 @@ function Action-PipelineSD {
     $folder = Select-WindowsFolder -Title "Select Comic Folder to Process" -InitialFolder $Global:State.LastComicFolder
     if (-not $folder) { return }
 
-    $lang = Prompt-Language -DefaultLang $Global:State.LastLanguage
+    $activeLang = if ($Global:State.LastLanguage) { $Global:State.LastLanguage } else { $Global:Defaults.DEFAULT_LANGUAGE }
+    $lang = Prompt-Language -DefaultLang $activeLang
     $Global:State.LastLanguage = $lang
     Save-SavedState $Global:State
 
@@ -602,9 +732,12 @@ function Action-ExportPrompts {
         return
     }
 
-    $lang = Prompt-Language -DefaultLang $Global:State.LastLanguage
-    $outFile = Read-Host "  Output filename (Default: prompts.txt inside comic folder)"
-    if ([string]::IsNullOrWhiteSpace($outFile)) { $outFile = "prompts.txt" }
+    $activeLang = if ($Global:State.LastLanguage) { $Global:State.LastLanguage } else { $Global:Defaults.DEFAULT_LANGUAGE }
+    $lang = Prompt-Language -DefaultLang $activeLang
+
+    $defExport = $Global:Defaults.DEFAULT_EXPORT_FILENAME
+    $outFile = Read-Host "  Output filename (Default: $defExport inside comic folder)"
+    if ([string]::IsNullOrWhiteSpace($outFile)) { $outFile = $defExport }
 
     $argsList = @($folder, "--lang", $lang, "--export-only", "--export-prompts", $outFile)
     $null = Invoke-PipelineScript -ScriptName "edit_comics.py" -Arguments $argsList
@@ -614,10 +747,15 @@ function Action-ExportPrompts {
 function Action-TestServers {
     Write-Host "`n--- [7] TEST API SERVER CONNECTIONS ---" -ForegroundColor Yellow
 
+    $h = $Global:Defaults.DEFAULT_HOST
+    $llamaTestUrl = "$h`:$($Global:Defaults.DEFAULT_LLAMA_PORT)/v1/models"
+    $comfyTestUrl = "$($Global:Defaults.DEFAULT_COMFY_API_URL)/system_stats"
+    $sdTestUrl    = "$h`:$($Global:Defaults.DEFAULT_SD_PORT)/v1/models"
+
     $endpoints = @(
-        @{ Name = "llama-server Vision API"; Url = "http://localhost:8080/v1/models" },
-        @{ Name = "ComfyUI Server";          Url = "http://localhost:8188/system_stats" },
-        @{ Name = "SD Server API";           Url = "http://localhost:8080/v1/models" }
+        @{ Name = "llama-server Vision API"; Url = $llamaTestUrl },
+        @{ Name = "ComfyUI Server";          Url = $comfyTestUrl },
+        @{ Name = "SD Server API";           Url = $sdTestUrl }
     )
 
     Write-Host ""
@@ -689,6 +827,30 @@ function Action-OpenExplorer {
     }
 }
 
+# 9. View Dynamic Defaults
+function Action-ViewDefaults {
+    Write-Host "`n--- CURRENT DEFAULTS (Loaded dynamically from common.py) ---" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_LANGUAGE", $Global:Defaults.DEFAULT_LANGUAGE) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}s" -f "DEFAULT_DELAY", $Global:Defaults.DEFAULT_DELAY) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}s" -f "DEFAULT_COMFY_DELAY", $Global:Defaults.DEFAULT_COMFY_DELAY) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_THINKING_EFFORT", $Global:Defaults.DEFAULT_THINKING_EFFORT) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1} tokens" -f "DEFAULT_THINKING_BUDGET", $Global:Defaults.DEFAULT_THINKING_BUDGET) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_STEPS", $Global:Defaults.DEFAULT_STEPS) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_CFG", $Global:Defaults.DEFAULT_CFG) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}px" -f "DEFAULT_MAX_SIDE", $Global:Defaults.DEFAULT_MAX_SIDE) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_SAMPLER", $Global:Defaults.DEFAULT_SAMPLER) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_SCHEDULER", $Global:Defaults.DEFAULT_SCHEDULER) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_HOST", $Global:Defaults.DEFAULT_HOST) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_LLAMA_PORT", $Global:Defaults.DEFAULT_LLAMA_PORT) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_SD_PORT", $Global:Defaults.DEFAULT_SD_PORT) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_COMFY_PORT", $Global:Defaults.DEFAULT_COMFY_PORT) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_TIMEOUT", $Global:Defaults.DEFAULT_TIMEOUT) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_RETRIES", $Global:Defaults.DEFAULT_RETRIES) -ForegroundColor White
+    Write-Host ""
+    Write-Host "  [i] Edit common.py anytime to change any of these defaults." -ForegroundColor DarkGray
+}
+
 # ==============================================================================
 # MAIN MENU LOOP
 # ==============================================================================
@@ -697,7 +859,7 @@ function Show-MainMenu {
 
     $lastFolderDisplay = if ($Global:State.LastComicFolder) { $Global:State.LastComicFolder } else { "(None selected yet)" }
     $lastWfDisplay     = if ($Global:State.LastWorkflowFile) { Split-Path $Global:State.LastWorkflowFile -Leaf } else { "(None)" }
-    $lastLangDisplay   = $Global:State.LastLanguage
+    $lastLangDisplay   = if ($Global:State.LastLanguage) { $Global:State.LastLanguage } else { $Global:Defaults.DEFAULT_LANGUAGE }
 
     Write-Host "================================================================================" -ForegroundColor Cyan
     Write-Host "              COMIC TRANSLATION & INPAINTING WORKSPACE                          " -ForegroundColor Yellow
@@ -706,6 +868,7 @@ function Show-MainMenu {
     Write-Host "  Active Comic: $lastFolderDisplay" -ForegroundColor DarkCyan
     Write-Host "  Workflow    : $lastWfDisplay" -ForegroundColor DarkCyan
     Write-Host "  Language    : $lastLangDisplay" -ForegroundColor DarkCyan
+    Write-Host "  Delays      : API=$($Global:Defaults.DEFAULT_DELAY)s | Comfy=$($Global:Defaults.DEFAULT_COMFY_DELAY)s" -ForegroundColor DarkGray
     Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  PIPELINE ACTIONS:" -ForegroundColor White
     Write-Host "    [1] 🌐 Translate Comic Pages            (llama-translate.py)" -ForegroundColor Cyan
@@ -718,6 +881,7 @@ function Show-MainMenu {
     Write-Host "  UTILITIES:" -ForegroundColor White
     Write-Host "    [7] 🔌 Test Server Connections (Llama / ComfyUI / SD)" -ForegroundColor White
     Write-Host "    [8] 📂 Open Comic / Edited Output in Windows Explorer" -ForegroundColor White
+    Write-Host "    [S] ⚙️  View Current Defaults (from common.py)" -ForegroundColor White
     Write-Host "    [R] 🔄 Reset / Change Active Comic Folder" -ForegroundColor DarkYellow
     Write-Host "    [Q] 🚪 Exit" -ForegroundColor Red
     Write-Host "================================================================================" -ForegroundColor Cyan
@@ -738,6 +902,7 @@ while ($true) {
         "6" { Action-ExportPrompts; Pause-Menu }
         "7" { Action-TestServers; Pause-Menu }
         "8" { Action-OpenExplorer; Pause-Menu }
+        "S" { Action-ViewDefaults; Pause-Menu }
         "R" {
             $f = Select-WindowsFolder -Title "Set Active Comic Folder" -InitialFolder $Global:State.LastComicFolder
             if ($f) {
