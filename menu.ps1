@@ -345,7 +345,8 @@ function Invoke-PipelineScript {
     $targetScript = Join-Path $ScriptDir $ScriptName
     if (-not (Test-Path $targetScript)) {
         Write-Host "`n  [ERROR] Script not found: $targetScript" -ForegroundColor Red
-        return $false
+        $Global:LastScriptSuccess = $false
+        return
     }
 
     $uvExe = Get-Command "uv" -ErrorAction SilentlyContinue
@@ -359,25 +360,27 @@ function Invoke-PipelineScript {
     Write-Host "================================================================================" -ForegroundColor Cyan
     Write-Host ""
 
-    $exitCode = 0
+    # Enable unbuffered stream and force Rich live terminal rendering
+    $env:PYTHONUNBUFFERED = "1"
+    $env:FORCE_COLOR = "1"
+    $env:PYTHONIOENCODING = "utf-8"
+
     if ($uvExe) {
         & $uvExe.Source run --project "$ScriptDir" python "$targetScript" @Arguments
-        $exitCode = $LASTEXITCODE
     } elseif (Test-Path $venvPy) {
         & "$venvPy" "$targetScript" @Arguments
-        $exitCode = $LASTEXITCODE
     } else {
         $sysPy = Get-Command "python" -ErrorAction SilentlyContinue
         if ($sysPy) {
             & $sysPy.Source "$targetScript" @Arguments
-            $exitCode = $LASTEXITCODE
         } else {
             Write-Host "`n  [ERROR] Neither 'uv' nor 'python' was found in PATH." -ForegroundColor Red
-            return $false
+            $Global:LastScriptSuccess = $false
+            return
         }
     }
 
-    return ($exitCode -eq 0)
+    $Global:LastScriptSuccess = ($LASTEXITCODE -eq 0)
 }
 
 # ==============================================================================
@@ -496,7 +499,7 @@ function Action-Translate {
         return
     }
 
-    $null = Invoke-PipelineScript -ScriptName "llama-translate.py" -Arguments $argsList
+    Invoke-PipelineScript -ScriptName "llama-translate.py" -Arguments $argsList
 }
 
 # 2. Inpaint via ComfyUI
@@ -565,7 +568,7 @@ function Action-InpaintComfy {
         return
     }
 
-    $null = Invoke-PipelineScript -ScriptName "edit_comics_comfy.py" -Arguments $argsList
+    Invoke-PipelineScript -ScriptName "edit_comics_comfy.py" -Arguments $argsList
 }
 
 # 3. Inpaint via SD Server
@@ -639,7 +642,7 @@ function Action-InpaintSD {
         return
     }
 
-    $null = Invoke-PipelineScript -ScriptName "edit_comics.py" -Arguments $argsList
+    Invoke-PipelineScript -ScriptName "edit_comics.py" -Arguments $argsList
 }
 
 # 4. End-to-End Pipeline: Translate + ComfyUI
@@ -676,15 +679,15 @@ function Action-PipelineComfy {
 
     # Step 1: Translate
     Write-Host "`n>>> [STEP 1/2] RUNNING TRANSLATION..." -ForegroundColor Magenta
-    $transSuccess = Invoke-PipelineScript -ScriptName "llama-translate.py" -Arguments @($folder, "--lang", $lang)
-    if (-not $transSuccess) {
+    Invoke-PipelineScript -ScriptName "llama-translate.py" -Arguments @($folder, "--lang", $lang)
+    if (-not $Global:LastScriptSuccess) {
         Write-Host "`n  [!] Translation reported errors. Please inspect the output above." -ForegroundColor Yellow
         if (-not (Prompt-ConfirmExecution "Proceed to ComfyUI Inpainting anyway?")) { return }
     }
 
     # Step 2: Comfy Inpaint
     Write-Host "`n>>> [STEP 2/2] RUNNING COMFYUI INPAINTING..." -ForegroundColor Magenta
-    $null = Invoke-PipelineScript -ScriptName "edit_comics_comfy.py" -Arguments @($folder, $workflow, "--lang", $lang)
+    Invoke-PipelineScript -ScriptName "edit_comics_comfy.py" -Arguments @($folder, $workflow, "--lang", $lang)
 }
 
 # 5. End-to-End Pipeline: Translate + SD
@@ -708,15 +711,15 @@ function Action-PipelineSD {
 
     # Step 1: Translate
     Write-Host "`n>>> [STEP 1/2] RUNNING TRANSLATION..." -ForegroundColor Magenta
-    $transSuccess = Invoke-PipelineScript -ScriptName "llama-translate.py" -Arguments @($folder, "--lang", $lang)
-    if (-not $transSuccess) {
+    Invoke-PipelineScript -ScriptName "llama-translate.py" -Arguments @($folder, "--lang", $lang)
+    if (-not $Global:LastScriptSuccess) {
         Write-Host "`n  [!] Translation reported errors. Please inspect the output above." -ForegroundColor Yellow
         if (-not (Prompt-ConfirmExecution "Proceed to SD Inpainting anyway?")) { return }
     }
 
     # Step 2: SD Inpaint
     Write-Host "`n>>> [STEP 2/2] RUNNING SD SERVER INPAINTING..." -ForegroundColor Magenta
-    $null = Invoke-PipelineScript -ScriptName "edit_comics.py" -Arguments @($folder, "--lang", $lang)
+    Invoke-PipelineScript -ScriptName "edit_comics.py" -Arguments @($folder, "--lang", $lang)
 }
 
 # 6. Export Prompts Only
@@ -740,7 +743,7 @@ function Action-ExportPrompts {
     if ([string]::IsNullOrWhiteSpace($outFile)) { $outFile = $defExport }
 
     $argsList = @($folder, "--lang", $lang, "--export-only", "--export-prompts", $outFile)
-    $null = Invoke-PipelineScript -ScriptName "edit_comics.py" -Arguments $argsList
+    Invoke-PipelineScript -ScriptName "edit_comics.py" -Arguments $argsList
 }
 
 # 7. Test Server Connections

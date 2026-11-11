@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import time
@@ -77,8 +78,12 @@ DEFAULT_COMFY_DELAY = 120.0     # Default delay in seconds between ComfyUI calls
 
 # ==============================================================================
 
-# Use legacy_windows=False to ensure true Unicode rounded corners (╭─╮, ╰─╯) and glyphs
-console = Console(legacy_windows=False)
+# Use legacy_windows=False to ensure true Unicode rounded corners (╭─╮, ╰─╯) and glyphs.
+# Enable force_terminal when running in environments like PowerShell runners where FORCE_COLOR=1 is set.
+console = Console(
+    legacy_windows=False,
+    force_terminal=True if os.environ.get("FORCE_COLOR") == "1" else None
+)
 
 # --- Common Constants ---
 
