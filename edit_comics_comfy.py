@@ -86,18 +86,42 @@ def inject_prompt_text(node: dict, prompt_text: str):
 
 def clean_workflow_graph(workflow: dict) -> dict:
     """
-    Strips in-graph delay nodes (e.g. 'Add Delay') and UI comparer nodes (e.g. 'Image Comparer')
-    so that Python cleanly handles inter-page delays without ComfyUI blocking internally.
+    Prepares the workflow graph for API execution:
+    1. Sets any in-graph delay nodes (e.g. 'Add Delay') to 0 seconds so ComfyUI doesn't block internally,
+       while keeping the graph connections completely intact for downstream nodes (like PreviewImage / SaveImage).
+    2. Strips standalone UI comparer nodes (e.g. 'Image Comparer') if nothing depends on them.
     """
     wf = copy.deepcopy(workflow)
-    nodes_to_remove = []
+
+    # 1. Neutralize delay nodes by setting delay to 0
     for node_id, node in wf.items():
         if isinstance(node, dict):
             c_type = node.get("class_type", "")
-            if c_type in {"Add Delay", "Image Comparer (rgthree)", "Image Comparer"} or node_id in {"103", "104"}:
-                nodes_to_remove.append(node_id)
-    for node_id in nodes_to_remove:
-        wf.pop(node_id, None)
+            if c_type == "Add Delay":
+                inputs = node.setdefault("inputs", {})
+                for delay_k in ["delay_seconds", "delay", "seconds"]:
+                    if delay_k in inputs:
+                        inputs[delay_k] = 0
+
+    # 2. Safely remove UI comparer nodes only if nothing downstream references them
+    comparer_ids = set()
+    for node_id, node in wf.items():
+        if isinstance(node, dict):
+            c_type = node.get("class_type", "")
+            if c_type in {"Image Comparer (rgthree)", "Image Comparer"} or node_id in {"104"}:
+                comparer_ids.add(node_id)
+
+    for cid in comparer_ids:
+        referenced = False
+        for other_id, other_node in wf.items():
+            if other_id != cid and isinstance(other_node, dict):
+                for in_val in other_node.get("inputs", {}).values():
+                    if isinstance(in_val, list) and len(in_val) > 0 and str(in_val[0]) == cid:
+                        referenced = True
+                        break
+        if not referenced:
+            wf.pop(cid, None)
+
     return wf
 
 def upload_image_to_comfy(base_url: str, image_path: Path, timeout: int = 120) -> str:

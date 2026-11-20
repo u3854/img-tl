@@ -870,14 +870,19 @@ function Action-BatchComfy {
         Save-SavedState $Global:State
 
         $defT2iDelay = if ($Global:Defaults.DEFAULT_T2I_DELAY) { $Global:Defaults.DEFAULT_T2I_DELAY } else { 5.0 }
-        $defT2iOut   = if ($Global:Defaults.DEFAULT_T2I_OUTPUT_DIR) { $Global:Defaults.DEFAULT_T2I_OUTPUT_DIR } else { "temp_output" }
+        $promptsDir  = Split-Path $promptsFile -Parent
 
         Write-Host "`n  Options:" -ForegroundColor White
+        Write-Host "  Default Output: $promptsDir (folder where prompt file is located)" -ForegroundColor DarkCyan
+        $customOut  = Read-Host "  Custom subfolder or path (Press Enter to save directly in prompt file folder)"
         $delayInput = Read-Host "  Delay between generations in seconds (Default: $defT2iDelay)"
         $randomSeed = Read-Host "  Randomize seed for each prompt? [y/N]"
         $overwrite  = Read-Host "  Overwrite existing generated images? [y/N]"
 
-        $argsList = @("--mode", "t2i", "--prompts", $promptsFile, "--workflow", $workflow, "--output-dir", $defT2iOut)
+        $argsList = @("--mode", "t2i", "--prompts", $promptsFile, "--workflow", $workflow)
+        if ($customOut -and -not [string]::IsNullOrWhiteSpace($customOut)) {
+            $argsList += @("--output-dir", $customOut.Trim())
+        }
 
         if ($delayInput -and [double]::TryParse($delayInput, [ref]$null)) {
             $argsList += @("--delay", $delayInput.Trim())
@@ -943,7 +948,7 @@ function Action-OpenExplorer {
     Write-Host "    [1] Open Comic Folder" -ForegroundColor Cyan
     Write-Host "    [2] Open 'edited\' Subfolder" -ForegroundColor Cyan
     Write-Host "    [3] Open Project Directory ($ScriptDir)" -ForegroundColor Cyan
-    Write-Host "    [4] Open 'temp_output\' (T2I Generated Images)" -ForegroundColor Cyan
+    Write-Host "    [4] Open T2I Generated Output Folder" -ForegroundColor Cyan
     Write-Host "    [5] Pick another folder to open" -ForegroundColor Cyan
 
     $choice = Read-Host "  Select option [1-5] (Default: 1)"
@@ -977,7 +982,11 @@ function Action-OpenExplorer {
             Start-Process explorer.exe $ScriptDir
         }
         "4" {
-            $t2iPath = Join-Path $ScriptDir "temp_output"
+            $t2iPath = if ($Global:State.LastPromptsFile -and (Test-Path $Global:State.LastPromptsFile)) {
+                Split-Path $Global:State.LastPromptsFile -Parent
+            } else {
+                Join-Path $ScriptDir "temp_output"
+            }
             if (-not (Test-Path $t2iPath)) {
                 New-Item -ItemType Directory -Path $t2iPath -Force | Out-Null
             }

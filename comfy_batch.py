@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import sys
 import copy
 import json
@@ -123,16 +124,43 @@ def randomize_workflow_seeds(workflow: dict):
                 inputs["noise_seed"] = new_seed
 
 def clean_workflow_graph(workflow: dict) -> dict:
-    """Strips in-graph delay nodes and UI comparer nodes."""
+    """
+    Prepares the workflow graph for API execution:
+    1. Sets any in-graph delay nodes (e.g. 'Add Delay') to 0 seconds so ComfyUI doesn't block internally,
+       while keeping the graph connections completely intact for downstream nodes (like PreviewImage / SaveImage).
+    2. Strips standalone UI comparer nodes (e.g. 'Image Comparer') if nothing depends on them.
+    """
     wf = copy.deepcopy(workflow)
-    nodes_to_remove = []
+
+    # 1. Neutralize delay nodes by setting delay to 0
     for node_id, node in wf.items():
         if isinstance(node, dict):
             c_type = node.get("class_type", "")
-            if c_type in {"Add Delay", "Image Comparer (rgthree)", "Image Comparer"} or node_id in {"103", "104"}:
-                nodes_to_remove.append(node_id)
-    for node_id in nodes_to_remove:
-        wf.pop(node_id, None)
+            if c_type == "Add Delay":
+                inputs = node.setdefault("inputs", {})
+                for delay_k in ["delay_seconds", "delay", "seconds"]:
+                    if delay_k in inputs:
+                        inputs[delay_k] = 0
+
+    # 2. Safely remove UI comparer nodes only if nothing downstream references them
+    comparer_ids = set()
+    for node_id, node in wf.items():
+        if isinstance(node, dict):
+            c_type = node.get("class_type", "")
+            if c_type in {"Image Comparer (rgthree)", "Image Comparer"} or node_id in {"104"}:
+                comparer_ids.add(node_id)
+
+    for cid in comparer_ids:
+        referenced = False
+        for other_id, other_node in wf.items():
+            if other_id != cid and isinstance(other_node, dict):
+                for in_val in other_node.get("inputs", {}).values():
+                    if isinstance(in_val, list) and len(in_val) > 0 and str(in_val[0]) == cid:
+                        referenced = True
+                        break
+        if not referenced:
+            wf.pop(cid, None)
+
     return wf
 
 def upload_image_to_comfy(base_url: str, image_path: Path, timeout: int = 120) -> str:
@@ -222,10 +250,71 @@ def run_comfy_generation(
 
     return Image.open(io.BytesIO(img_resp.content)).convert("RGB")
 
+# --- Manifest & Persistence Helpers ---
+
+def load_existing_manifest(manifest_path: Path) -> tuple[dict[str, dict], list[dict]]:
+    """
+    Loads manifest.json if present, returning:
+      - prompt_map: dict mapping stripped prompt text to record
+      - raw_list: list of all existing records in chronological order
+    """
+    if not manifest_path.is_file():
+        return {}, []
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}, []
+
+    records = []
+    if isinstance(data, list):
+        records = data
+    elif isinstance(data, dict):
+        if "items" in data and isinstance(data["items"], list):
+            records = data["items"]
+        else:
+            for k, v in data.items():
+                if isinstance(v, dict):
+                    rec = dict(v)
+                    if "prompt" not in rec:
+                        rec["prompt"] = k
+                    records.append(rec)
+
+    prompt_map = {}
+    for r in records:
+        if isinstance(r, dict) and "prompt" in r:
+            p_key = str(r["prompt"]).strip()
+            if r.get("success", True):
+                prompt_map[p_key] = r
+
+    return prompt_map, records
+
+def find_highest_index(output_dir: Path, existing_records: list[dict]) -> int:
+    """Finds the highest numerical index among image files on disk and existing manifest records."""
+    highest = 0
+    if output_dir.is_dir():
+        for f in output_dir.iterdir():
+            if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTENSIONS:
+                m = re.match(r"^(\d+)", f.stem)
+                if m:
+                    num = int(m.group(1))
+                    if num > highest:
+                        highest = num
+    for r in existing_records:
+        if isinstance(r, dict):
+            fn = r.get("filename", "")
+            m = re.match(r"^(\d+)", Path(fn).stem)
+            if m:
+                num = int(m.group(1))
+                if num > highest:
+                    highest = num
+    return highest
+
 # --- Batch Mode Runners ---
 
 def run_t2i_mode(args, workflow_template: dict, workflow_path: Path, base_url: str):
-    """Executes batch Text-to-Image (T2I) generation from a JSON list of prompts."""
+    """Executes batch Text-to-Image (T2I) generation from a JSON list of prompts with prompt-based deduplication."""
     prompt_node_id = args.prompt_node or find_prompt_node(workflow_template)
     if not prompt_node_id:
         print_error(f"No prompt text node found in workflow '{workflow_path.name}'. Use --prompt-node to specify.")
@@ -250,55 +339,96 @@ def run_t2i_mode(args, workflow_template: dict, workflow_path: Path, base_url: s
         print_warning(f"No valid prompt strings found in '{prompts_file.name}'.")
         return
 
-    # Resolve output directory (default: temp_output in repo root)
+    # Resolve output directory (default: same folder where prompts file exists)
     if args.output_dir:
         output_dir = clean_path(args.output_dir)
         if not output_dir.is_absolute():
-            output_dir = Path.cwd() / output_dir
+            output_dir = prompts_file.parent / output_dir
     else:
-        output_dir = Path.cwd() / DEFAULT_T2I_OUTPUT_DIR
+        output_dir = prompts_file.parent
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    pad_width = max(3, len(str(len(prompt_list))))
+    manifest_file = output_dir / "manifest.json"
+    prompt_map, manifest_records = load_existing_manifest(manifest_file)
+    highest_num = find_highest_index(output_dir, manifest_records)
+
+    # Pre-partition queue: match by prompt text
+    items_to_process = []
+    already_completed = 0
+
+    for i, p_text in enumerate(prompt_list, start=1):
+        p_key = p_text.strip()
+        is_cached = False
+        assigned_filename = None
+
+        if p_key in prompt_map:
+            cached_record = prompt_map[p_key]
+            cached_fn = cached_record.get("filename", "")
+            cached_path = output_dir / cached_fn if cached_fn else None
+            if cached_path and cached_path.is_file():
+                assigned_filename = cached_fn
+                if not args.overwrite:
+                    is_cached = True
+
+        if is_cached:
+            already_completed += 1
+        else:
+            if not assigned_filename:
+                highest_num += 1
+                assigned_filename = f"{highest_num:03d}.png"
+
+            items_to_process.append({
+                "prompt": p_text,
+                "filename": assigned_filename,
+                "out_path": output_dir / assigned_filename,
+                "input_index": i
+            })
+
     inter_delay = args.delay if args.delay is not None else DEFAULT_T2I_DELAY
 
     # Startup Banner
+    queue_summary = f"{len(items_to_process)} to generate"
+    if already_completed > 0:
+        queue_summary += f", {already_completed} already completed"
+    queue_summary += f" ({len(prompt_list)} total in prompt file)"
+
     banner_info = {
         "Mode": "Text-to-Image (T2I Batch)",
         "Prompts File": prompts_file,
         "Workflow JSON": workflow_path,
         "Output Folder": output_dir,
         "ComfyUI URL": base_url,
-        "Total Prompts": f"{len(prompt_list)} prompts queued",
+        "Queue Status": queue_summary,
         "Workflow Nodes": f"Prompt (Node {prompt_node_id}) │ Seed={'Randomized' if args.random_seed else 'From Workflow'}",
         "Constraints": f"Delay={inter_delay}s │ Retries={args.retries} │ Timeout={args.timeout}s",
     }
     print_banner(
         title="🎨 BATCH TEXT-TO-IMAGE (T2I) GENERATOR",
-        subtitle="Generating images from JSON prompt list via ComfyUI API",
+        subtitle="Prompt-indexed image generation via ComfyUI API",
         fields=banner_info,
         border_style="bright_cyan"
     )
 
-    tracker = SessionTracker(total_work_items=len(prompt_list))
-    manifest = []
-    manifest_file = output_dir / "manifest.json"
+    if not items_to_process:
+        print_success(f"All {len(prompt_list)} prompt(s) in '{prompts_file.name}' have already been generated in '{output_dir}'! (Nothing to do)")
+        return
 
-    for i, p_text in enumerate(prompt_list, start=1):
-        filename = f"{i:0{pad_width}d}.png"
-        out_img_path = output_dir / filename
+    tracker = SessionTracker(total_work_items=len(items_to_process))
 
-        if not args.overwrite and out_img_path.exists():
-            print_info(f"[{i}/{len(prompt_list)}] Output [bold cyan]{filename}[/bold cyan] already exists. Skipping.")
-            continue
+    for idx, item in enumerate(items_to_process, start=1):
+        filename = item["filename"]
+        out_img_path = item["out_path"]
+        p_text = item["prompt"]
+        p_key = p_text.strip()
+        orig_pos = item["input_index"]
 
         preview_snip = p_text if len(p_text) <= 65 else (p_text[:62] + "...")
         print_step_header(
-            queue_pos=i,
-            queue_total=len(prompt_list),
+            queue_pos=idx,
+            queue_total=len(items_to_process),
             filename=filename,
-            extra=f'"{preview_snip}"'
+            extra=f'Prompt #{orig_pos}: "{preview_snip}"'
         )
 
         console.print(f"  [dim]Prompt:[/dim] [bold white]{p_text}[/bold white]")
@@ -336,23 +466,40 @@ def run_t2i_mode(args, workflow_template: dict, workflow_path: Path, base_url: s
                     else:
                         print_error(f"Failed after [bold]{args.retries + 1}[/bold] attempts: {e}")
                 except Exception as e:
-                    print_error(f"Unexpected error on prompt #{i}: {e}")
+                    print_error(f"Unexpected error on prompt #{orig_pos}: {e}")
                     break
 
         api_elapsed = time.perf_counter() - api_start
         cycle_elapsed = time.perf_counter() - cycle_start
 
-        manifest.append({
-            "index": i,
-            "filename": filename,
-            "prompt": p_text,
-            "success": generated_successfully,
-            "duration": round(api_elapsed, 2),
-            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-        })
+        # Update or append prompt entry in manifest
+        now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+        updated = False
+        for r in manifest_records:
+            if isinstance(r, dict) and str(r.get("prompt", "")).strip() == p_key:
+                r.update({
+                    "filename": filename,
+                    "success": generated_successfully,
+                    "duration": round(api_elapsed, 2),
+                    "timestamp": now_str
+                })
+                updated = True
+                break
+
+        if not updated:
+            new_entry = {
+                "prompt": p_text,
+                "filename": filename,
+                "success": generated_successfully,
+                "duration": round(api_elapsed, 2),
+                "timestamp": now_str
+            }
+            manifest_records.append(new_entry)
+            prompt_map[p_key] = new_entry
+
         try:
             with open(manifest_file, "w", encoding="utf-8") as mf:
-                json.dump(manifest, mf, indent=2, ensure_ascii=False)
+                json.dump(manifest_records, mf, indent=2, ensure_ascii=False)
         except Exception:
             pass
 
@@ -360,7 +507,7 @@ def run_t2i_mode(args, workflow_template: dict, workflow_path: Path, base_url: s
             print_success(f"Image saved to [bold cyan]{filename}[/bold cyan] in [bold white]{format_duration(api_elapsed)}[/bold white]")
             tracker.record_step(api_time=api_elapsed, cycle_time=cycle_elapsed, success=True)
 
-            rem_items = len(prompt_list) - i
+            rem_items = len(items_to_process) - idx
             projected_sec, finish_clock = tracker.estimate_remaining(inter_item_delay=inter_delay)
             print_stats(
                 api_duration=api_elapsed,
@@ -374,18 +521,19 @@ def run_t2i_mode(args, workflow_template: dict, workflow_path: Path, base_url: s
             if rem_items > 0 and inter_delay > 0:
                 countdown_delay(inter_delay)
         else:
-            print_error(f"Generation failed for prompt #{i}")
+            print_error(f"Generation failed for prompt #{orig_pos}")
             tracker.record_step(api_time=api_elapsed, cycle_time=cycle_elapsed, success=False)
 
     print_summary(
         title="✨ BATCH T2I GENERATION COMPLETE",
-        total_processed=len(prompt_list),
+        total_processed=len(items_to_process),
         successful=tracker.successful_items,
         failed=tracker.failed_items,
         total_time=tracker.total_elapsed,
         output_path=output_dir,
         extras={
-            "Prompts Generated": tracker.successful_items,
+            "New Generated": tracker.successful_items,
+            "Previously Cached": already_completed,
             "Manifest": manifest_file.name,
             "Workflow Used": workflow_path.name
         },
@@ -654,7 +802,7 @@ def main():
     parser.add_argument(
         "--output-dir", "-o",
         default=None,
-        help="Output directory or subfolder name to save generated images"
+        help="Output directory or subfolder name (default: folder where prompts file exists for T2I, or 'edited' for I2I)"
     )
     parser.add_argument(
         "--delay",

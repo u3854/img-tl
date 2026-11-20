@@ -2,7 +2,7 @@ __pycache__
 .venv
 *.txt
 
-qwen21-gguf.json
+*.json
 .menu_state.json
 temp_output/
 temp_t2i/
