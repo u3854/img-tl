@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import json
 import time
 import argparse
 from pathlib import Path
@@ -53,7 +54,7 @@ DEFAULT_SD_API_URL = f"{DEFAULT_HOST}:{DEFAULT_SD_PORT}/v1/images/edits"
 DEFAULT_COMFY_API_URL = f"{DEFAULT_HOST}:{DEFAULT_COMFY_PORT}"
 
 # Network & Operational Defaults
-DEFAULT_DELAY = 120.0       # Delay in seconds between API calls
+DEFAULT_DELAY = 60.0       # Delay in seconds between API calls
 DEFAULT_TIMEOUT = 600      # Request timeout in seconds
 DEFAULT_RETRIES = 2        # Retry attempts on network/timeout errors
 RETRY_DELAY = 10.0         # Cooldown in seconds before a retry attempt
@@ -61,7 +62,7 @@ RETRY_DELAY = 10.0         # Cooldown in seconds before a retry attempt
 # llama-translate.py Defaults
 DEFAULT_LANGUAGE = "chinese"
 DEFAULT_OUTPUT_FILENAME = "translations.json"
-DEFAULT_THINKING_EFFORT = "low"
+DEFAULT_THINKING_EFFORT = "none"
 DEFAULT_THINKING_BUDGET = 1024
 
 # edit_comics.py Defaults
@@ -75,6 +76,8 @@ DEFAULT_SCHEDULER = "simple"
 
 # edit_comics_comfy.py Defaults
 DEFAULT_COMFY_DELAY = 120.0     # Default delay in seconds between ComfyUI calls
+DEFAULT_T2I_DELAY = 180.0          # Default delay in seconds between T2I batch calls
+DEFAULT_T2I_OUTPUT_DIR = "temp_output"  # Default untracked subfolder for batch T2I output
 
 # ==============================================================================
 
@@ -130,6 +133,10 @@ FIELD_ICONS = {
     "constraints": "⏱️",
     "comfyui url": "🔌",
     "workflow nodes": "🔗",
+    "prompts file": "📝",
+    "prompts list": "📝",
+    "constant prompt": "💬",
+    "mode": "🔀",
 }
 
 
@@ -228,6 +235,55 @@ def export_prompts_to_file(
         f.write("\n\n".join(entries) + "\n")
 
     return len(entries)
+
+
+def load_prompts_file(prompts_path: Union[str, Path]) -> list[str]:
+    """
+    Loads a list of prompts from a JSON file.
+    Supports:
+      - Plain list of strings: ["prompt 1", "prompt 2", ...]
+      - Dictionary with 'prompt' key: {"prompt": ["prompt 1", "prompt 2", ...]}
+      - Dictionary with 'prompts' key: {"prompts": ["prompt 1", "prompt 2", ...]}
+      - List of dict items: [{"prompt": "prompt 1"}, ...]
+    """
+    path = Path(prompts_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"Prompts file not found at '{path}'")
+
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    prompts: list[str] = []
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                s = item.strip()
+                if s:
+                    prompts.append(s)
+            elif isinstance(item, dict):
+                p = item.get("prompt") or item.get("text") or ""
+                if str(p).strip():
+                    prompts.append(str(p).strip())
+    elif isinstance(data, dict):
+        raw_list = data.get("prompt")
+        if raw_list is None:
+            raw_list = data.get("prompts")
+        if isinstance(raw_list, list):
+            for item in raw_list:
+                if isinstance(item, str):
+                    s = item.strip()
+                    if s:
+                        prompts.append(s)
+                elif isinstance(item, dict):
+                    p = item.get("prompt") or item.get("text") or ""
+                    if str(p).strip():
+                        prompts.append(str(p).strip())
+        elif isinstance(raw_list, str):
+            s = raw_list.strip()
+            if s:
+                prompts.append(s)
+
+    return prompts
 
 
 # --- ETA & Progress Tracker ---

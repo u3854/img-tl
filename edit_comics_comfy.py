@@ -51,16 +51,38 @@ def find_node_by_class(workflow: dict, class_types: Set[str]) -> Optional[str]:
 def find_prompt_node(workflow: dict) -> Optional[str]:
     """
     Identifies the text prompt node in the workflow. Checks common text encoder class types first,
-    then falls back to any node accepting a 'prompt' input.
+    then falls back to any node accepting a 'prompt' or 'text' input.
     """
-    preferred_classes = {"TextEncodeQwenImage21", "CLIPTextEncode", "CLIPTextEncodeSDXL"}
+    preferred_classes = {
+        "TextEncodeQwenImage21",
+        "CLIPTextEncode",
+        "CLIPTextEncodeSDXL",
+        "CLIPTextEncodeFlux"
+    }
     for node_id, node in workflow.items():
         if isinstance(node, dict) and node.get("class_type") in preferred_classes:
-            return node_id
+            title = (node.get("_meta", {}).get("title") or "").lower()
+            if "negative" not in title:
+                return node_id
+
     for node_id, node in workflow.items():
-        if isinstance(node, dict) and "inputs" in node and "prompt" in node["inputs"]:
-            return node_id
+        if isinstance(node, dict) and "inputs" in node:
+            title = (node.get("_meta", {}).get("title") or "").lower()
+            if "negative" in title:
+                continue
+            if "prompt" in node["inputs"] or "text" in node["inputs"]:
+                return node_id
     return None
+
+def inject_prompt_text(node: dict, prompt_text: str):
+    """Sets prompt text into either 'prompt' or 'text' input widget as supported by the node."""
+    inputs = node.setdefault("inputs", {})
+    if "text" in inputs:
+        inputs["text"] = prompt_text
+    elif "prompt" in inputs:
+        inputs["prompt"] = prompt_text
+    else:
+        inputs["prompt"] = prompt_text
 
 def clean_workflow_graph(workflow: dict) -> dict:
     """
@@ -112,7 +134,7 @@ def edit_image_via_comfy(
 
     # 3. Inject only the input image and replacement prompt
     wf[image_node_id]["inputs"]["image"] = uploaded_filename
-    wf[prompt_node_id]["inputs"]["prompt"] = prompt_text
+    inject_prompt_text(wf[prompt_node_id], prompt_text)
 
     # 4. Queue prompt
     queue_resp = requests.post(f"{base_url}/prompt", json={"prompt": wf}, timeout=30)

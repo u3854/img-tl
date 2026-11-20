@@ -99,11 +99,10 @@ Surgically replaces comic text with English translations using the ComfyUI API a
 Only the input comic image and the generated translation prompt are injected by the script—all model loaders, samplers, steps, CFG, seed, and VAE settings remain 100% controlled by your exported workflow.
 
 ```powershell
-uv run python edit_comics_comfy.py "path/to/comic_folder/translations.json" "path/to/workflow.json" --lang chinese
+uv run python edit_comics_comfy.py "path/to/comic_folder" -w "qwen21-gguf.json" --lang chinese
 ```
-*(You can also pass the workflow via `-w`: `uv run python edit_comics_comfy.py "path/to/comic_folder" -w "path/to/workflow.json" --lang chinese`)*
 
-### Common Options:
+### Options:
 - `translations_file` *(mandatory)*: Path to `translations.json` or comic directory.
 - `workflow_file` / `--workflow`, `-w` *(mandatory)*: Path to exported ComfyUI workflow JSON (API format).
 - `--lang`, `-l`: Source language (default: generic `'original text'`).
@@ -113,6 +112,44 @@ uv run python edit_comics_comfy.py "path/to/comic_folder/translations.json" "pat
 - `--timeout`: Request timeout in seconds (default: `600`).
 - `--retries`: Retry attempts on network/timeout errors (default: `2`).
 - `--overwrite`: Overwrite already edited images in the output folder.
-- `--export-prompts [FILE]`: Export image paths and prompt strings to a text file (default: `prompts.txt` in the comic folder).
-- `--export-only`: Only export prompts to the text file without executing inpainting edits.
+- `--export-prompts [FILE]`: Export image paths and prompt strings to a text file.
+- `--export-only`: Only export prompts to the text file without executing inpainting.
+
+---
+
+## 4. Batch ComfyUI Generation (`comfy_batch.py`)
+
+Standalone batch runner for generating images via ComfyUI API workflows:
+
+### A. Batch Text-to-Image (T2I from Prompts JSON)
+```powershell
+uv run python comfy_batch.py --t2i --prompts "prompts.json" -w "t2i-workflow.json"
+# With custom options:
+uv run python comfy_batch.py --mode t2i --prompts "prompts.json" -w "t2i-workflow.json" --delay 5 --random-seed --output-dir "temp_output"
+```
+*Supports prompt lists formatted as either a plain string array `["prompt 1", "prompt 2"]` or an object `{"prompt": ["prompt 1", "prompt 2"]}`. Outputs are saved to an untracked `temp_output/` directory alongside a structured `manifest.json`.*
+
+### B. Batch Image-to-Image (I2I with Constant Prompt)
+```powershell
+uv run python comfy_batch.py --i2i --images "path/to/images" --prompt "masterpiece, enhance details" -w "workflow.json"
+# Or using a prompt file:
+uv run python comfy_batch.py --mode i2i --images "path/to/images" --prompt-file "prompt.txt" -w "workflow.json"
+```
+
+### Options:
+- `workflow_file` / `--workflow`, `-w` *(mandatory)*: Path to exported ComfyUI workflow JSON (API format).
+- `--mode`, `-m`: Batch mode (`t2i` or `i2i`). Auto-detected from `--prompts` or `--images`/`--prompt`.
+- `--prompts`: Path to prompts JSON file (for T2I).
+- `--images`: Path to folder containing images to process (for I2I).
+- `--prompt`, `-p`: Constant prompt string for all images (for I2I).
+- `--prompt-file`: Path to text file containing constant prompt (for I2I).
+- `--random-seed`: Randomize seeds across all sampler nodes for each generation.
+- `--prompt-node`: Override prompt node ID in the workflow.
+- `--image-node`: Override LoadImage node ID in the workflow (for I2I).
+- `--output-dir`, `-o`: Subfolder or output path (default: `temp_output` for T2I, `edited` for I2I).
+- `--delay`: Delay between generations in seconds (default: `5.0`s for T2I, `120.0`s for I2I).
+- `--comfy-url`: ComfyUI server base URL (default: `http://localhost:8188`).
+- `--timeout`: Request timeout in seconds (default: `600`).
+- `--retries`: Retry attempts on network/timeout errors (default: `2`).
+- `--overwrite`: Overwrite existing images in output folder.
 

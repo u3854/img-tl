@@ -203,6 +203,8 @@ function Get-PipelineDefaults {
             DEFAULT_LANGUAGE        = "chinese"
             DEFAULT_DELAY           = 120.0
             DEFAULT_COMFY_DELAY     = 120.0
+            DEFAULT_T2I_DELAY       = 5.0
+            DEFAULT_T2I_OUTPUT_DIR  = "temp_output"
             DEFAULT_THINKING_EFFORT = "low"
             DEFAULT_THINKING_BUDGET = 1024
             DEFAULT_STEPS           = 4
@@ -302,26 +304,41 @@ $StateFile = Join-Path $ScriptDir ".menu_state.json"
 # ==============================================================================
 # STATE MANAGEMENT
 # ==============================================================================
-function Get-SavedState {
-    if (Test-Path $StateFile) {
-        try {
-            $json = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
-            if ($json) {
-                # Ensure defaults fill in any missing fields
-                if (-not $json.LastLanguage) { $json | Add-Member -NotePropertyName "LastLanguage" -NotePropertyValue $Global:Defaults.DEFAULT_LANGUAGE -Force }
-                if (-not $json.LastThinkingEffort) { $json | Add-Member -NotePropertyName "LastThinkingEffort" -NotePropertyValue $Global:Defaults.DEFAULT_THINKING_EFFORT -Force }
-                if (-not $json.LastDelay) { $json | Add-Member -NotePropertyName "LastDelay" -NotePropertyValue $Global:Defaults.DEFAULT_DELAY -Force }
-                return $json
-            }
-        } catch {}
+function Set-StateProp {
+    param([string]$Name, $Value)
+    if ($Global:State -and $Global:State.PSObject.Properties[$Name]) {
+        $Global:State.$Name = $Value
+    } elseif ($Global:State) {
+        $Global:State | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force
     }
-    return [PSCustomObject]@{
+}
+
+function Get-SavedState {
+    $defaultsMap = @{
         LastComicFolder    = ""
         LastWorkflowFile   = (Join-Path $ScriptDir "qwen21-gguf.json")
         LastLanguage       = $Global:Defaults.DEFAULT_LANGUAGE
         LastThinkingEffort = $Global:Defaults.DEFAULT_THINKING_EFFORT
         LastDelay          = $Global:Defaults.DEFAULT_DELAY
+        LastPromptsFile    = ""
+        LastConstantPrompt = ""
     }
+
+    if (Test-Path $StateFile) {
+        try {
+            $json = Get-Content $StateFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($json) {
+                # Ensure all required properties exist on the PSCustomObject
+                foreach ($key in $defaultsMap.Keys) {
+                    if ($null -eq $json.PSObject.Properties[$key]) {
+                        $json | Add-Member -NotePropertyName $key -NotePropertyValue $defaultsMap[$key] -Force
+                    }
+                }
+                return $json
+            }
+        } catch {}
+    }
+    return [PSCustomObject]$defaultsMap
 }
 
 function Save-SavedState {
@@ -746,9 +763,144 @@ function Action-ExportPrompts {
     Invoke-PipelineScript -ScriptName "edit_comics.py" -Arguments $argsList
 }
 
-# 7. Test Server Connections
+# 7. Batch ComfyUI Generation (T2I / I2I)
+function Action-BatchComfy {
+    Write-Host "`n--- [7] BATCH COMFYUI GENERATION (comfy_batch.py) ---" -ForegroundColor Yellow
+
+    Write-Host "`n  Select Batch Mode:" -ForegroundColor White
+    Write-Host "    [1] 🎨 Text-to-Image (T2I) Batch (from Prompts JSON) [Default]" -ForegroundColor Cyan
+    Write-Host "    [2] 🖼️  Image-to-Image (I2I) Batch (Constant Prompt + Image Folder)" -ForegroundColor Cyan
+    $modeChoice = Read-Host "  Choose mode [1/2] (Default: 1)"
+    if ([string]::IsNullOrWhiteSpace($modeChoice)) { $modeChoice = "1" }
+
+    if ($modeChoice.Trim() -eq "2") {
+        # I2I Mode
+        $folder = Select-WindowsFolder -Title "Select Folder with Images to Process" -InitialFolder $Global:State.LastComicFolder
+        if (-not $folder) { return }
+
+        $Global:State.LastComicFolder = $folder
+        Save-SavedState $Global:State
+
+        Write-Host "`n  Prompt Mode:" -ForegroundColor White
+        Write-Host "    [1] Enter prompt text directly [Default]" -ForegroundColor Cyan
+        Write-Host "    [2] Select a text file (.txt) containing the prompt" -ForegroundColor Cyan
+        $pChoice = Read-Host "  Select [1/2] (Default: 1)"
+        if ([string]::IsNullOrWhiteSpace($pChoice)) { $pChoice = "1" }
+
+        $promptArgs = @()
+        if ($pChoice.Trim() -eq "2") {
+            $txtFile = Select-WindowsFile -Title "Select Prompt Text File" -Filter "Text Files (*.txt)|*.txt|All Files (*.*)|*.*" -InitialPath $folder
+            if (-not $txtFile) { return }
+            $promptArgs = @("--prompt-file", $txtFile)
+        } else {
+            $defaultP = if ($Global:State.LastConstantPrompt) { $Global:State.LastConstantPrompt } else { "" }
+            $promptPrompt = if ($defaultP) { "  Enter custom constant prompt (Default: '$defaultP')" } else { "  Enter custom constant prompt" }
+            $userPrompt = Read-Host $promptPrompt
+            if ([string]::IsNullOrWhiteSpace($userPrompt)) {
+                $userPrompt = $defaultP
+            }
+            if ([string]::IsNullOrWhiteSpace($userPrompt)) {
+                Write-Host "  [!] Error: Constant prompt cannot be empty." -ForegroundColor Red
+                return
+            }
+            Set-StateProp "LastConstantPrompt" $userPrompt
+            Save-SavedState $Global:State
+            $promptArgs = @("--prompt", $userPrompt)
+        }
+
+        $workflowInit = if ($Global:State.LastWorkflowFile -and (Test-Path $Global:State.LastWorkflowFile)) {
+            $Global:State.LastWorkflowFile
+        } else {
+            (Join-Path $ScriptDir "qwen21-gguf.json")
+        }
+
+        $workflow = Select-WindowsFile -Title "Select ComfyUI Workflow JSON (API format)" -Filter "JSON Files (*.json)|*.json" -InitialPath $workflowInit
+        if (-not $workflow) { return }
+
+        $Global:State.LastWorkflowFile = $workflow
+        Save-SavedState $Global:State
+
+        $defComfyDelay = $Global:Defaults.DEFAULT_COMFY_DELAY
+        Write-Host "`n  Options:" -ForegroundColor White
+        $delayInput = Read-Host "  Delay between ComfyUI calls in seconds (Default: $defComfyDelay)"
+        $randomSeed = Read-Host "  Randomize seed for each image? [y/N]"
+        $overwrite  = Read-Host "  Overwrite existing images in output subfolder? [y/N]"
+
+        $argsList = @("--mode", "i2i", "--images", $folder, "--workflow", $workflow) + $promptArgs
+        if ($delayInput -and [double]::TryParse($delayInput, [ref]$null)) {
+            $argsList += @("--delay", $delayInput.Trim())
+        }
+        if ($randomSeed -and $randomSeed.Trim().ToLower() -eq "y") {
+            $argsList += "--random-seed"
+        }
+        if ($overwrite -and $overwrite.Trim().ToLower() -eq "y") {
+            $argsList += "--overwrite"
+        }
+
+        if (-not (Prompt-ConfirmExecution)) {
+            Write-Host "  [!] Operation cancelled by user." -ForegroundColor Yellow
+            return
+        }
+
+        Invoke-PipelineScript -ScriptName "comfy_batch.py" -Arguments $argsList
+    } else {
+        # T2I Mode
+        $initPrompts = if ($Global:State.LastPromptsFile -and (Test-Path $Global:State.LastPromptsFile)) {
+            $Global:State.LastPromptsFile
+        } else {
+            $ScriptDir
+        }
+
+        $promptsFile = Select-WindowsFile -Title "Select Prompts JSON File (Array or {'prompt': [...]})" -Filter "JSON Files (*.json)|*.json|All Files (*.*)|*.*" -InitialPath $initPrompts
+        if (-not $promptsFile) { return }
+
+        Set-StateProp "LastPromptsFile" $promptsFile
+        Save-SavedState $Global:State
+
+        $workflowInit = if ($Global:State.LastWorkflowFile -and (Test-Path $Global:State.LastWorkflowFile)) {
+            $Global:State.LastWorkflowFile
+        } else {
+            (Join-Path $ScriptDir "qwen21-gguf.json")
+        }
+
+        $workflow = Select-WindowsFile -Title "Select ComfyUI Workflow JSON (API format)" -Filter "JSON Files (*.json)|*.json" -InitialPath $workflowInit
+        if (-not $workflow) { return }
+
+        $Global:State.LastWorkflowFile = $workflow
+        Save-SavedState $Global:State
+
+        $defT2iDelay = if ($Global:Defaults.DEFAULT_T2I_DELAY) { $Global:Defaults.DEFAULT_T2I_DELAY } else { 5.0 }
+        $defT2iOut   = if ($Global:Defaults.DEFAULT_T2I_OUTPUT_DIR) { $Global:Defaults.DEFAULT_T2I_OUTPUT_DIR } else { "temp_output" }
+
+        Write-Host "`n  Options:" -ForegroundColor White
+        $delayInput = Read-Host "  Delay between generations in seconds (Default: $defT2iDelay)"
+        $randomSeed = Read-Host "  Randomize seed for each prompt? [y/N]"
+        $overwrite  = Read-Host "  Overwrite existing generated images? [y/N]"
+
+        $argsList = @("--mode", "t2i", "--prompts", $promptsFile, "--workflow", $workflow, "--output-dir", $defT2iOut)
+
+        if ($delayInput -and [double]::TryParse($delayInput, [ref]$null)) {
+            $argsList += @("--delay", $delayInput.Trim())
+        }
+        if ($randomSeed -and $randomSeed.Trim().ToLower() -eq "y") {
+            $argsList += "--random-seed"
+        }
+        if ($overwrite -and $overwrite.Trim().ToLower() -eq "y") {
+            $argsList += "--overwrite"
+        }
+
+        if (-not (Prompt-ConfirmExecution)) {
+            Write-Host "  [!] Operation cancelled by user." -ForegroundColor Yellow
+            return
+        }
+
+        Invoke-PipelineScript -ScriptName "comfy_batch.py" -Arguments $argsList
+    }
+}
+
+# 8. Test Server Connections
 function Action-TestServers {
-    Write-Host "`n--- [7] TEST API SERVER CONNECTIONS ---" -ForegroundColor Yellow
+    Write-Host "`n--- [8] TEST API SERVER CONNECTIONS ---" -ForegroundColor Yellow
 
     $h = $Global:Defaults.DEFAULT_HOST
     $llamaTestUrl = "$h`:$($Global:Defaults.DEFAULT_LLAMA_PORT)/v1/models"
@@ -785,15 +937,16 @@ function Action-TestServers {
     Write-Host ""
 }
 
-# 8. Open Folder in Explorer
+# 9. Open Folder in Explorer
 function Action-OpenExplorer {
-    Write-Host "`n--- [8] OPEN FOLDER IN FILE EXPLORER ---" -ForegroundColor Yellow
+    Write-Host "`n--- [9] OPEN FOLDER IN FILE EXPLORER ---" -ForegroundColor Yellow
     Write-Host "    [1] Open Comic Folder" -ForegroundColor Cyan
     Write-Host "    [2] Open 'edited\' Subfolder" -ForegroundColor Cyan
     Write-Host "    [3] Open Project Directory ($ScriptDir)" -ForegroundColor Cyan
-    Write-Host "    [4] Pick another folder to open" -ForegroundColor Cyan
+    Write-Host "    [4] Open 'temp_output\' (T2I Generated Images)" -ForegroundColor Cyan
+    Write-Host "    [5] Pick another folder to open" -ForegroundColor Cyan
 
-    $choice = Read-Host "  Select option [1-4] (Default: 1)"
+    $choice = Read-Host "  Select option [1-5] (Default: 1)"
     if ([string]::IsNullOrWhiteSpace($choice)) { $choice = "1" }
 
     switch ($choice.Trim()) {
@@ -824,6 +977,13 @@ function Action-OpenExplorer {
             Start-Process explorer.exe $ScriptDir
         }
         "4" {
+            $t2iPath = Join-Path $ScriptDir "temp_output"
+            if (-not (Test-Path $t2iPath)) {
+                New-Item -ItemType Directory -Path $t2iPath -Force | Out-Null
+            }
+            Start-Process explorer.exe $t2iPath
+        }
+        "5" {
             $f = Select-WindowsFolder
             if ($f) { Start-Process explorer.exe $f }
         }
@@ -837,6 +997,8 @@ function Action-ViewDefaults {
     Write-Host ("  {0,-26} : {1}" -f "DEFAULT_LANGUAGE", $Global:Defaults.DEFAULT_LANGUAGE) -ForegroundColor White
     Write-Host ("  {0,-26} : {1}s" -f "DEFAULT_DELAY", $Global:Defaults.DEFAULT_DELAY) -ForegroundColor White
     Write-Host ("  {0,-26} : {1}s" -f "DEFAULT_COMFY_DELAY", $Global:Defaults.DEFAULT_COMFY_DELAY) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}s" -f "DEFAULT_T2I_DELAY", $Global:Defaults.DEFAULT_T2I_DELAY) -ForegroundColor White
+    Write-Host ("  {0,-26} : {1}" -f "DEFAULT_T2I_OUTPUT_DIR", $Global:Defaults.DEFAULT_T2I_OUTPUT_DIR) -ForegroundColor White
     Write-Host ("  {0,-26} : {1}" -f "DEFAULT_THINKING_EFFORT", $Global:Defaults.DEFAULT_THINKING_EFFORT) -ForegroundColor White
     Write-Host ("  {0,-26} : {1} tokens" -f "DEFAULT_THINKING_BUDGET", $Global:Defaults.DEFAULT_THINKING_BUDGET) -ForegroundColor White
     Write-Host ("  {0,-26} : {1}" -f "DEFAULT_STEPS", $Global:Defaults.DEFAULT_STEPS) -ForegroundColor White
@@ -880,10 +1042,11 @@ function Show-MainMenu {
     Write-Host "    [4] 🚀 Full Pipeline: Translate + ComfyUI" -ForegroundColor Green
     Write-Host "    [5] ⚡ Full Pipeline: Translate + SD Server" -ForegroundColor Green
     Write-Host "    [6] 📝 Export Prompts Only              (--export-only)" -ForegroundColor Cyan
+    Write-Host "    [7] ✨ Batch ComfyUI Generation         (comfy_batch.py)" -ForegroundColor Cyan
     Write-Host "--------------------------------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "  UTILITIES:" -ForegroundColor White
-    Write-Host "    [7] 🔌 Test Server Connections (Llama / ComfyUI / SD)" -ForegroundColor White
-    Write-Host "    [8] 📂 Open Comic / Edited Output in Windows Explorer" -ForegroundColor White
+    Write-Host "    [8] 🔌 Test Server Connections (Llama / ComfyUI / SD)" -ForegroundColor White
+    Write-Host "    [9] 📂 Open Comic / Output in Windows Explorer" -ForegroundColor White
     Write-Host "    [S] ⚙️  View Current Defaults (from common.py)" -ForegroundColor White
     Write-Host "    [R] 🔄 Reset / Change Active Comic Folder" -ForegroundColor DarkYellow
     Write-Host "    [Q] 🚪 Exit" -ForegroundColor Red
@@ -903,8 +1066,9 @@ while ($true) {
         "4" { Action-PipelineComfy; Pause-Menu }
         "5" { Action-PipelineSD; Pause-Menu }
         "6" { Action-ExportPrompts; Pause-Menu }
-        "7" { Action-TestServers; Pause-Menu }
-        "8" { Action-OpenExplorer; Pause-Menu }
+        "7" { Action-BatchComfy; Pause-Menu }
+        "8" { Action-TestServers; Pause-Menu }
+        "9" { Action-OpenExplorer; Pause-Menu }
         "S" { Action-ViewDefaults; Pause-Menu }
         "R" {
             $f = Select-WindowsFolder -Title "Set Active Comic Folder" -InitialFolder $Global:State.LastComicFolder
